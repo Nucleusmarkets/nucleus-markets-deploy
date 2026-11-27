@@ -1836,7 +1836,9 @@ adminRouter.get("/kyc/:id/file", async (req, res, next) => {
     }
     res.setHeader("Content-Type", row.mime);
     res.setHeader("X-Content-Type-Options", "nosniff");
-    res.setHeader("Content-Disposition", `inline; filename="${row.filename.replace(/"/g, "")}"`);
+    res.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Content-Disposition", `inline; filename="${row.filename.replace(/["\\\r\n]/g, "")}"`);
     res.setHeader("Cache-Control", "private, no-store");
     res.send(row.content);
   } catch (err) {
@@ -2504,6 +2506,13 @@ app.use(
     crossOriginEmbedderPolicy: false
   })
 );
+app.use((_req, res, next) => {
+  res.setHeader(
+    "Permissions-Policy",
+    "accelerometer=(), autoplay=(self), camera=(), display-capture=(), encrypted-media=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), usb=(), xr-spatial-tracking=()"
+  );
+  next();
+});
 app.use(compression());
 app.use(express.json({ limit: "100kb" }));
 app.get("/api/health", async (_req, res) => {
