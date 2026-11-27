@@ -185,7 +185,11 @@ var statements = [
      subject     text,
      deployed_at timestamptz not null default now(),
      notified_at timestamptz
-   )`
+   )`,
+  // "Continue with Google": the stable Google account id, not the email, is what
+  // identifies a returning Google user, since an address can change hands.
+  `alter table users add column if not exists google_sub text`,
+  `create unique index if not exists users_google_sub_key on users (google_sub) where google_sub is not null`
 ];
 async function syncAdmins() {
   const emails = (process.env.ADMIN_EMAILS ?? "").split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
@@ -1011,6 +1015,191 @@ adminRouter.get("/actions", async (req, res, next) => {
   }
 });
 
+// server/google.ts
+import { createHash as createHash2, randomBytes as randomBytes3, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
+import { Router as Router3 } from "express";
+var CLIENT_ID = process.env.GOOGLE_CLIENT_ID ?? "";
+var CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET ?? "";
+var SITE = (process.env.SITE_URL ?? "https://nucleusmarkets.com").replace(/\/+$/, "");
+var REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI ?? `${SITE}/api/auth/google/callback`;
+var isProd2 = process.env.NODE_ENV === "production" || !!process.env.RENDER;
+var googleEnabled = CLIENT_ID.length > 0 && CLIENT_SECRET.length > 0;
+var STATE_COOKIE = "ns_g_state";
+var STATE_PATH = "/api/auth/google";
+var STATE_MINUTES = 10;
+var b64url = (buf) => buf.toString("base64url");
+function sameSecret(a, b) {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual2(x, y);
+}
+function fail(res, mode, code) {
+  res.redirect(303, `/${mode}?google=${encodeURIComponent(code)}`);
+}
+function clearState(res) {
+  res.clearCookie(STATE_COOKIE, { httpOnly: true, secure: isProd2, sameSite: "lax", path: STATE_PATH });
+}
+function readIdToken(idToken) {
+  const parts = idToken.split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    const issOk = claims.iss === "https://accounts.google.com" || claims.iss === "accounts.google.com";
+    const audOk = claims.aud === CLIENT_ID;
+    const fresh = typeof claims.exp === "number" && claims.exp * 1e3 > Date.now() - 6e4;
+    if (!issOk || !audOk || !fresh || !claims.sub) return null;
+    return claims;
+  } catch {
+    return null;
+  }
+}
+var clean = (v, max2 = 80) => typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, max2) : "";
+var placeholderHash = () => `scrypt$16384$8$1$${randomBytes3(16).toString("base64")}$${randomBytes3(64).toString("base64")}`;
+var googleRouter = Router3();
+googleRouter.get("/google/start", (req, res) => {
+  const mode = req.query.mode === "register" ? "register" : "login";
+  if (!googleEnabled) return fail(res, mode, "off");
+  const pending = {
+    state: b64url(randomBytes3(24)),
+    verifier: b64url(randomBytes3(48)),
+    mode,
+    terms: mode === "register" && req.query.terms === "1",
+    country: mode === "register" ? clean(req.query.country, 8).toUpperCase() : "",
+    sophisticated: mode === "register" && req.query.sophisticated === "1"
+  };
+  res.cookie(STATE_COOKIE, b64url(Buffer.from(JSON.stringify(pending))), {
+    httpOnly: true,
+    secure: isProd2,
+    // Lax, not Strict: the callback is a top-level navigation coming back from Google.
+    sameSite: "lax",
+    path: STATE_PATH,
+    maxAge: STATE_MINUTES * 60 * 1e3
+  });
+  const challenge = b64url(createHash2("sha256").update(pending.verifier).digest());
+  const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  url.search = new URLSearchParams({
+    client_id: CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    response_type: "code",
+    scope: "openid email profile",
+    state: pending.state,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    prompt: "select_account"
+  }).toString();
+  res.redirect(302, url.toString());
+});
+googleRouter.get("/google/callback", async (req, res) => {
+  const ip = clientIp(req);
+  const raw = readCookie(req, STATE_COOKIE);
+  clearState(res);
+  let pending = null;
+  try {
+    pending = raw ? JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) : null;
+  } catch {
+    pending = null;
+  }
+  const mode = pending?.mode === "register" ? "register" : "login";
+  if (typeof req.query.error === "string") return fail(res, mode, "cancelled");
+  const state = typeof req.query.state === "string" ? req.query.state : "";
+  const code = typeof req.query.code === "string" ? req.query.code : "";
+  if (!googleEnabled) return fail(res, mode, "off");
+  if (!pending || !state || !code || !sameSecret(state, pending.state)) {
+    await logEvent("google_bad_state", null, ip);
+    return fail(res, mode, "expired");
+  }
+  try {
+    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        code,
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        redirect_uri: REDIRECT_URI,
+        grant_type: "authorization_code",
+        code_verifier: pending.verifier
+      }),
+      signal: AbortSignal.timeout(1e4)
+    });
+    const tokens = await tokenRes.json().catch(() => ({}));
+    if (!tokenRes.ok || !tokens.id_token) {
+      console.error("[google] token exchange failed:", tokenRes.status, tokens.error ?? "");
+      return fail(res, mode, "failed");
+    }
+    const claims = readIdToken(tokens.id_token);
+    const email = clean(claims?.email, 254).toLowerCase();
+    const verified = claims?.email_verified === true || claims?.email_verified === "true";
+    if (!claims || !email || !verified) {
+      await logEvent("google_unverified", email || null, ip);
+      return fail(res, mode, "unverified");
+    }
+    const sub = claims.sub;
+    let found = await query(
+      "select id, status, google_sub from users where google_sub = $1",
+      [sub]
+    );
+    let row = found.rows[0];
+    let kind = "google_login";
+    if (!row) {
+      found = await query("select id, status, google_sub from users where lower(email) = $1", [email]);
+      row = found.rows[0];
+      if (row?.google_sub && row.google_sub !== sub) {
+        await logEvent("google_conflict", email, ip);
+        return fail(res, mode, "conflict");
+      }
+      if (row) {
+        await query(
+          `update users set google_sub = $1, email_verified_at = coalesce(email_verified_at, now()),
+                  updated_at = now() where id = $2`,
+          [sub, row.id]
+        );
+        kind = "google_link";
+      }
+    }
+    if (!row) {
+      if (!pending.terms || !pending.country || needsSophisticatedDeclaration(pending.country) && !pending.sophisticated) {
+        await logEvent("google_needs_terms", email, ip);
+        return fail(res, "register", "terms");
+      }
+      if (!isValidCountry(pending.country)) {
+        await logEvent("google_bad_country", email, ip);
+        return fail(res, "register", "country");
+      }
+      if (await countEvents("register", "ip", ip, 60) >= LIMITS.registerPerIpPerHour) {
+        await logEvent("register_throttled", email, ip);
+        return fail(res, "register", "throttled");
+      }
+      const first = clean(claims.given_name) || clean(claims.name).split(" ")[0] || "Nucleus";
+      const last = clean(claims.family_name) || clean(claims.name).split(" ").slice(1).join(" ") || "Customer";
+      const inserted = await query(
+        `insert into users (email, first_name, last_name, password_hash, terms_accepted_at, signup_ip,
+                            google_sub, email_verified_at, country, sophisticated_at)
+         values ($1, $2, $3, $4, now(), $5, $6, now(), $7, case when $8::boolean then now() else null end)
+         returning id, status, google_sub`,
+        [email, first, last, placeholderHash(), ip, sub, pending.country, pending.sophisticated]
+      );
+      row = inserted.rows[0];
+      if (isListedAdmin(email)) {
+        await query("update users set role = 'admin', updated_at = now() where id = $1", [row.id]);
+      }
+      await logEvent("register", email, ip);
+      kind = "google_register";
+    }
+    if (row.status !== "active") {
+      await logEvent("login_blocked", email, ip);
+      return fail(res, mode, "blocked");
+    }
+    const token = await createSession(row.id, req);
+    setSessionCookie(res, token);
+    await logEvent(kind, email, ip);
+    res.redirect(303, "/portal");
+  } catch (err) {
+    console.error("[google] callback error:", err.message);
+    return fail(res, mode, "failed");
+  }
+});
+
 // server/deploy-notice.ts
 import fs from "node:fs";
 import path from "node:path";
@@ -1167,7 +1356,11 @@ app.get("/api/health", async (_req, res) => {
   const database = dbConfigured ? await dbHealthy() ? "up" : "down" : "not configured";
   res.json({ ok: true, service: "nucleus-markets", database, time: (/* @__PURE__ */ new Date()).toISOString() });
 });
+app.get("/api/auth/providers", (_req, res) => {
+  res.json({ ok: true, google: dbConfigured && googleEnabled });
+});
 if (dbConfigured) {
+  app.use("/api/auth", googleRouter);
   app.use("/api/auth", authRouter);
   app.use("/api/admin", adminRouter);
 } else {
