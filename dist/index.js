@@ -177,6 +177,55 @@ var statements = [
      created_at timestamptz not null default now()
    )`,
   `create index if not exists password_tokens_user_idx on password_tokens (user_id)`,
+  // ---------------------------------------------------------------- IB / affiliates
+  // Every account gets a referral code; being an IB is a separate approval.
+  `alter table users add column if not exists referral_code text`,
+  `alter table users add column if not exists referred_by bigint references users (id) on delete set null`,
+  `alter table users add column if not exists ib_approved_at timestamptz`,
+  `alter table users add column if not exists commission_plan_id bigint`,
+  `create unique index if not exists users_referral_code_key on users (referral_code) where referral_code is not null`,
+  `create index if not exists users_referred_by_idx on users (referred_by)`,
+  `create table if not exists commission_plans (
+     id          bigserial primary key,
+     name        text        not null unique,
+     per_lot     numeric(12,4) not null default 0,
+     revenue_pct numeric(6,3)  not null default 0,
+     is_default  boolean     not null default false,
+     created_at  timestamptz not null default now()
+   )`,
+  /*
+   * The earnings ledger. One row per accrual, and nothing else is ever counted as
+   * earnings - on a sibling brand, payout receipts and profit-share were added to
+   * this total and overstated what affiliates were owed. Payouts live in their own
+   * table and are only ever subtracted.
+   */
+  `create table if not exists commissions (
+     id          bigserial primary key,
+     ib_id       bigint      not null references users (id) on delete cascade,
+     customer_id bigint      references users (id) on delete set null,
+     amount      numeric(14,2) not null check (amount >= 0),
+     source      text        not null,
+     note        text,
+     created_at  timestamptz not null default now()
+   )`,
+  `create index if not exists commissions_ib_idx on commissions (ib_id, created_at desc)`,
+  `create table if not exists payout_requests (
+     id           bigserial primary key,
+     ib_id        bigint      not null references users (id) on delete cascade,
+     amount       numeric(14,2) not null check (amount > 0),
+     destination  text        not null,
+     status       text        not null default 'requested',
+     note         text,
+     requested_at timestamptz not null default now(),
+     decided_at   timestamptz,
+     decided_by   bigint      references users (id),
+     decided_note text
+   )`,
+  `create index if not exists payout_requests_ib_idx on payout_requests (ib_id, requested_at desc)`,
+  `create index if not exists payout_requests_status_idx on payout_requests (status, requested_at)`,
+  `insert into commission_plans (name, per_lot, revenue_pct, is_default)
+     values ('Standard IB', 3.0000, 0, true)
+     on conflict (name) do nothing`,
   // One row per deployed build. The unique commit is what stops a restart, a second
   // instance or a rollback from emailing the admins about the same build twice.
   `create table if not exists deploys (

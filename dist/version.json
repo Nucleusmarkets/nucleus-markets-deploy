@@ -1,6 +1,6 @@
 {
-  "commit": "16f5350",
-  "subject": "Add Privacy Policy, Terms of Business and Risk Disclosure pages",
-  "body": "New pages at /privacy, /terms and /risk, linked from the footer and from\nthe terms box on account opening. They describe what the site actually\ncollects and which services it uses. No legal entity, address, regulator\nor governing law is named yet - add those once confirmed, and have\ncompliance review the text before funding goes live.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
-  "builtAt": "2026-11-27T07:52:15.900Z"
+  "commit": "6166b1b",
+  "subject": "Drop the price ticker from the hero, add the hero video prompt",
+  "body": "The scrolling quote strip showed invented prices under an \"illustrative\"\nlabel on a broker's front page. Removing it loses nothing real and takes a\ndistraction off the first screen.\n\nHero video support was already there; docs/hero-video-prompt.md has the\nGrok Imagine prompt, the framing constraint that keeps the headline\nreadable, and the encode settings.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
+  "builtAt": "2026-11-27T07:54:15.806Z"
 }
