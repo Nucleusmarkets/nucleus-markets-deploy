@@ -2,8 +2,8 @@
 import express from "express";
 import helmet from "helmet";
 import compression from "compression";
-import path from "node:path";
-import fs from "node:fs";
+import path2 from "node:path";
+import fs2 from "node:fs";
 import { fileURLToPath } from "node:url";
 
 // server/auth.ts
@@ -146,6 +146,11 @@ var statements = [
   // Added after the first release, so it has to be an alter rather than a column in
   // the create above - existing databases already have the table.
   `alter table users add column if not exists role text not null default 'customer'`,
+  // Residency, and the sophisticated-trader declaration that "Other" requires. Both
+  // are claims the customer made about themselves, so the timestamp matters as much
+  // as the value - it is the record of when they said it.
+  `alter table users add column if not exists country text`,
+  `alter table users add column if not exists sophisticated_at timestamptz`,
   `create index if not exists users_role_idx on users (role) where role <> 'customer'`,
   // Every staff action against a customer record, kept separately from auth_events
   // so an operator cannot quietly suspend or reinstate an account.
@@ -171,7 +176,16 @@ var statements = [
      used_at    timestamptz,
      created_at timestamptz not null default now()
    )`,
-  `create index if not exists password_tokens_user_idx on password_tokens (user_id)`
+  `create index if not exists password_tokens_user_idx on password_tokens (user_id)`,
+  // One row per deployed build. The unique commit is what stops a restart, a second
+  // instance or a rollback from emailing the admins about the same build twice.
+  `create table if not exists deploys (
+     id          bigserial primary key,
+     commit      text        not null unique,
+     subject     text,
+     deployed_at timestamptz not null default now(),
+     notified_at timestamptz
+   )`
 ];
 async function syncAdmins() {
   const emails = (process.env.ADMIN_EMAILS ?? "").split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
@@ -194,6 +208,131 @@ async function migrate() {
 async function pruneSessions() {
   const res = await query("delete from sessions where expires_at < now()");
   return res.rowCount ?? 0;
+}
+
+// shared/countries.ts
+var COUNTRIES = [
+  { code: "AE", name: "United Arab Emirates" },
+  { code: "AL", name: "Albania" },
+  { code: "AM", name: "Armenia" },
+  { code: "AO", name: "Angola" },
+  { code: "AR", name: "Argentina" },
+  { code: "AT", name: "Austria" },
+  { code: "AU", name: "Australia" },
+  { code: "AZ", name: "Azerbaijan" },
+  { code: "BA", name: "Bosnia and Herzegovina" },
+  { code: "BD", name: "Bangladesh" },
+  { code: "BE", name: "Belgium" },
+  { code: "BG", name: "Bulgaria" },
+  { code: "BH", name: "Bahrain" },
+  { code: "BR", name: "Brazil" },
+  { code: "BW", name: "Botswana" },
+  { code: "CA", name: "Canada" },
+  { code: "CH", name: "Switzerland" },
+  { code: "CL", name: "Chile" },
+  { code: "CM", name: "Cameroon" },
+  { code: "CO", name: "Colombia" },
+  { code: "CR", name: "Costa Rica" },
+  { code: "CY", name: "Cyprus" },
+  { code: "CZ", name: "Czechia" },
+  { code: "DE", name: "Germany" },
+  { code: "DK", name: "Denmark" },
+  { code: "DO", name: "Dominican Republic" },
+  { code: "DZ", name: "Algeria" },
+  { code: "EC", name: "Ecuador" },
+  { code: "EE", name: "Estonia" },
+  { code: "EG", name: "Egypt" },
+  { code: "ES", name: "Spain" },
+  { code: "ET", name: "Ethiopia" },
+  { code: "FI", name: "Finland" },
+  { code: "FR", name: "France" },
+  { code: "GB", name: "United Kingdom" },
+  { code: "GE", name: "Georgia" },
+  { code: "GH", name: "Ghana" },
+  { code: "GR", name: "Greece" },
+  { code: "GT", name: "Guatemala" },
+  { code: "HK", name: "Hong Kong" },
+  { code: "HR", name: "Croatia" },
+  { code: "HU", name: "Hungary" },
+  { code: "ID", name: "Indonesia" },
+  { code: "IE", name: "Ireland" },
+  { code: "IL", name: "Israel" },
+  { code: "IN", name: "India" },
+  { code: "IQ", name: "Iraq" },
+  { code: "IS", name: "Iceland" },
+  { code: "IT", name: "Italy" },
+  { code: "JM", name: "Jamaica" },
+  { code: "JO", name: "Jordan" },
+  { code: "JP", name: "Japan" },
+  { code: "KE", name: "Kenya" },
+  { code: "KG", name: "Kyrgyzstan" },
+  { code: "KH", name: "Cambodia" },
+  { code: "KR", name: "South Korea" },
+  { code: "KW", name: "Kuwait" },
+  { code: "KZ", name: "Kazakhstan" },
+  { code: "LB", name: "Lebanon" },
+  { code: "LK", name: "Sri Lanka" },
+  { code: "LT", name: "Lithuania" },
+  { code: "LU", name: "Luxembourg" },
+  { code: "LV", name: "Latvia" },
+  { code: "MA", name: "Morocco" },
+  { code: "MD", name: "Moldova" },
+  { code: "ME", name: "Montenegro" },
+  { code: "MK", name: "North Macedonia" },
+  { code: "MN", name: "Mongolia" },
+  { code: "MT", name: "Malta" },
+  { code: "MU", name: "Mauritius" },
+  { code: "MV", name: "Maldives" },
+  { code: "MX", name: "Mexico" },
+  { code: "MY", name: "Malaysia" },
+  { code: "MZ", name: "Mozambique" },
+  { code: "NA", name: "Namibia" },
+  { code: "NG", name: "Nigeria" },
+  { code: "NL", name: "Netherlands" },
+  { code: "NO", name: "Norway" },
+  { code: "NP", name: "Nepal" },
+  { code: "NZ", name: "New Zealand" },
+  { code: "OM", name: "Oman" },
+  { code: "PA", name: "Panama" },
+  { code: "PE", name: "Peru" },
+  { code: "PH", name: "Philippines" },
+  { code: "PK", name: "Pakistan" },
+  { code: "PL", name: "Poland" },
+  { code: "PT", name: "Portugal" },
+  { code: "PY", name: "Paraguay" },
+  { code: "QA", name: "Qatar" },
+  { code: "RO", name: "Romania" },
+  { code: "RS", name: "Serbia" },
+  { code: "RW", name: "Rwanda" },
+  { code: "SA", name: "Saudi Arabia" },
+  { code: "SE", name: "Sweden" },
+  { code: "SG", name: "Singapore" },
+  { code: "SI", name: "Slovenia" },
+  { code: "SK", name: "Slovakia" },
+  { code: "SN", name: "Senegal" },
+  { code: "TH", name: "Thailand" },
+  { code: "TN", name: "Tunisia" },
+  { code: "TR", name: "Turkey" },
+  { code: "TT", name: "Trinidad and Tobago" },
+  { code: "TW", name: "Taiwan" },
+  { code: "TZ", name: "Tanzania" },
+  { code: "UA", name: "Ukraine" },
+  { code: "UG", name: "Uganda" },
+  { code: "UY", name: "Uruguay" },
+  { code: "UZ", name: "Uzbekistan" },
+  { code: "VN", name: "Vietnam" },
+  { code: "ZA", name: "South Africa" },
+  { code: "ZM", name: "Zambia" },
+  { code: "ZW", name: "Zimbabwe" },
+  { code: "OTHER", name: "Other / not listed" }
+];
+var OTHER = "OTHER";
+var BY_CODE = new Map(COUNTRIES.map((c) => [c.code, c]));
+function isValidCountry(code) {
+  return BY_CODE.has(code);
+}
+function needsSophisticatedDeclaration(code) {
+  return code === OTHER;
 }
 
 // server/auth.ts
@@ -458,6 +597,19 @@ authRouter.post("/register", async (req, res, next) => {
     if (!(terms === true || terms === "on" || terms === "true")) {
       throw new Invalid("Please accept the terms of business to continue.", "terms");
     }
+    const country = str(req.body?.country).toUpperCase();
+    if (!country) throw new Invalid("Select your country of residence.", "country");
+    if (!isValidCountry(country)) {
+      throw new Invalid("We can't open accounts in that country.", "country");
+    }
+    const declared = req.body?.sophisticated;
+    const isSophisticated = declared === true || declared === "on" || declared === "true";
+    if (needsSophisticatedDeclaration(country) && !isSophisticated) {
+      throw new Invalid(
+        "To continue under 'Other', confirm you qualify as a sophisticated trader.",
+        "sophisticated"
+      );
+    }
     if (await countEvents("register", "ip", ip, 60) >= LIMITS.registerPerIpPerHour) {
       await logEvent("register_throttled", email, ip);
       res.status(429).json({
@@ -469,10 +621,10 @@ authRouter.post("/register", async (req, res, next) => {
     const passwordHash = await hashPassword(password);
     const user = await withTransaction(async (client) => {
       const inserted = await client.query(
-        `insert into users (email, first_name, last_name, password_hash, terms_accepted_at, signup_ip)
-         values ($1, $2, $3, $4, now(), $5)
+        `insert into users (email, first_name, last_name, password_hash, terms_accepted_at, signup_ip, country, sophisticated_at)
+         values ($1, $2, $3, $4, now(), $5, $6, case when $7::boolean then now() else null end)
          returning id, email, first_name, last_name, status, role, email_verified_at, created_at`,
-        [email, firstName, lastName, passwordHash, ip]
+        [email, firstName, lastName, passwordHash, ip, country, isSophisticated]
       );
       return inserted.rows[0];
     });
@@ -628,6 +780,30 @@ adminRouter.get("/overview", async (_req, res, next) => {
     next(err);
   }
 });
+adminRouter.get("/signups", async (req, res, next) => {
+  try {
+    const days = Math.min(Math.max(Number(req.query.days) || 30, 7), 180);
+    const rows = await query(
+      `select d.day::date as day, count(u.id)::text as n
+         from generate_series(current_date - ($1::int - 1), current_date, interval '1 day') as d(day)
+         left join users u
+           on u.created_at >= d.day and u.created_at < d.day + interval '1 day'
+          and u.role = 'customer'
+        group by d.day
+        order by d.day`,
+      [days]
+    );
+    res.json({
+      ok: true,
+      days: rows.rows.map((r) => ({
+        day: new Date(r.day).toISOString().slice(0, 10),
+        count: Number(r.n)
+      }))
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 adminRouter.get("/customers", async (req, res, next) => {
   try {
     const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 120) : "";
@@ -685,7 +861,7 @@ adminRouter.get("/customers/:id", async (req, res, next) => {
     }
     const found = await query(
       `select id, email, first_name, last_name, status, role, email_verified_at,
-              terms_accepted_at, created_at, updated_at, signup_ip
+              terms_accepted_at, created_at, updated_at, signup_ip, country, sophisticated_at
          from users where id = $1`,
       [id]
     );
@@ -716,7 +892,9 @@ adminRouter.get("/customers/:id", async (req, res, next) => {
         emailVerified: u.email_verified_at !== null,
         termsAcceptedAt: u.terms_accepted_at ? new Date(u.terms_accepted_at).toISOString() : null,
         createdAt: new Date(u.created_at).toISOString(),
-        signupIp: u.signup_ip
+        signupIp: u.signup_ip,
+        country: u.country ?? null,
+        sophisticatedAt: u.sophisticated_at ? new Date(u.sophisticated_at).toISOString() : null
       },
       events: events.rows.map((e) => ({
         kind: e.kind,
@@ -833,9 +1011,133 @@ adminRouter.get("/actions", async (req, res, next) => {
   }
 });
 
+// server/deploy-notice.ts
+import fs from "node:fs";
+import path from "node:path";
+
+// server/mailer.ts
+var ENDPOINT = "https://api.resend.com/emails";
+function adminRecipients() {
+  return (process.env.ADMIN_EMAILS ?? "").split(",").map((e) => e.trim()).filter(Boolean);
+}
+function mailConfigured() {
+  return Boolean(process.env.RESEND_API_KEY) && adminRecipients().length > 0;
+}
+async function sendMail(opts) {
+  const key = process.env.RESEND_API_KEY;
+  if (!key || opts.to.length === 0) return null;
+  try {
+    const res = await fetch(ENDPOINT, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        from: process.env.MAIL_FROM ?? "Nucleus Markets <support@nucleusmarkets.com>",
+        reply_to: process.env.MAIL_REPLY_TO ?? "support@nucleusmarkets.com",
+        to: opts.to,
+        subject: opts.subject,
+        html: opts.html,
+        text: opts.text
+      })
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error("[mail] send failed:", body.message ?? res.status);
+      return null;
+    }
+    return body.id ?? null;
+  } catch (err) {
+    console.error("[mail] send threw:", err.message);
+    return null;
+  }
+}
+function escapeHtml(s) {
+  return s.replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
+}
+function deployEmail(info, site) {
+  const subject = `Nucleus Markets deployed - ${info.subject}`.slice(0, 180);
+  const safeSubject = escapeHtml(info.subject);
+  const safeBody = info.body ? escapeHtml(info.body).replace(/\n/g, "<br>") : "";
+  const when = new Date(info.builtAt ?? Date.now()).toUTCString();
+  const html = `<!doctype html>
+<html><body style="margin:0;background:#05060d;font-family:-apple-system,Segoe UI,Inter,Helvetica,Arial,sans-serif;color:#e6e8f2">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#05060d;padding:40px 16px">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#0a0c18;border:1px solid rgba(255,255,255,0.08);border-radius:18px;padding:32px">
+        <tr><td>
+          <p style="margin:0;font-size:12px;letter-spacing:4px;color:#22d3ee;text-transform:uppercase">Nucleus Markets</p>
+          <h1 style="margin:14px 0 0;font-size:22px;line-height:1.3;color:#ffffff;font-weight:600">${safeSubject}</h1>
+          <p style="margin:10px 0 0;font-size:13px;color:#6b7391">
+            <code style="color:#8fa0bd">${escapeHtml(info.commit)}</code> &middot; ${when}
+          </p>
+          ${safeBody ? `<div style="margin:22px 0 0;padding:16px;background:rgba(255,255,255,0.03);border-radius:12px;font-size:14px;line-height:1.65;color:#aab0c6">${safeBody}</div>` : ""}
+          <p style="margin:26px 0 0">
+            <a href="${site}/admin" style="display:inline-block;background:#22d3ee;color:#05060d;text-decoration:none;font-weight:600;font-size:14px;padding:12px 24px;border-radius:999px">Open the back office</a>
+          </p>
+          <p style="margin:24px 0 0;padding-top:18px;border-top:1px solid rgba(255,255,255,0.08);font-size:12px;line-height:1.6;color:#6b7391">
+            Sent automatically to every admin whenever ${escapeHtml(site.replace(/^https?:\/\//, ""))} is deployed.
+          </p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+  const text = [
+    "Nucleus Markets - deployed",
+    "",
+    info.subject,
+    `${info.commit} - ${when}`,
+    info.body ? `
+${info.body}` : "",
+    "",
+    `Back office: ${site}/admin`
+  ].join("\n");
+  return { subject, html, text };
+}
+
+// server/deploy-notice.ts
+async function announceDeploy(dir) {
+  const file = path.join(dir, "version.json");
+  if (!fs.existsSync(file)) return;
+  let info;
+  try {
+    info = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (err) {
+    console.error("[deploy] version.json is not readable:", err.message);
+    return;
+  }
+  if (!info.commit) return;
+  const inserted = await query(
+    `insert into deploys (commit, subject) values ($1, $2)
+     on conflict (commit) do nothing
+     returning id`,
+    [info.commit, info.subject ?? null]
+  );
+  if (inserted.rowCount === 0) {
+    console.log(`[deploy] build ${info.commit} already announced`);
+    return;
+  }
+  if (!mailConfigured()) {
+    console.warn("[deploy] no RESEND_API_KEY or ADMIN_EMAILS - not emailing anyone");
+    return;
+  }
+  const site = process.env.SITE_URL ?? "https://nucleusmarkets.com";
+  const to = adminRecipients();
+  const mail = deployEmail(info, site);
+  const id = await sendMail({ to, ...mail });
+  if (id) {
+    await query("update deploys set notified_at = now() where id = $1", [inserted.rows[0].id]);
+    console.log(`[deploy] told ${to.length} admin(s) about ${info.commit} (resend ${id})`);
+  } else {
+    console.error(`[deploy] could not email admins about ${info.commit}`);
+  }
+}
+
 // server/index.ts
-var here = path.dirname(fileURLToPath(import.meta.url));
-var publicDir = path.join(here, "public");
+var here = path2.dirname(fileURLToPath(import.meta.url));
+var publicDir = path2.join(here, "public");
 var app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
@@ -877,15 +1179,15 @@ if (dbConfigured) {
   });
 }
 app.use("/api", (_req, res) => res.status(404).json({ ok: false, message: "Not found" }));
-if (fs.existsSync(publicDir)) {
+if (fs2.existsSync(publicDir)) {
   app.use(
     "/assets",
-    express.static(path.join(publicDir, "assets"), { immutable: true, maxAge: "1y" })
+    express.static(path2.join(publicDir, "assets"), { immutable: true, maxAge: "1y" })
   );
   app.use(express.static(publicDir, { maxAge: "1h", index: false }));
   app.get("*", (_req, res) => {
     res.setHeader("Cache-Control", "no-cache");
-    res.sendFile(path.join(publicDir, "index.html"));
+    res.sendFile(path2.join(publicDir, "index.html"));
   });
 }
 app.use((err, req, res, _next) => {
@@ -902,6 +1204,9 @@ async function start() {
       const promoted = await syncAdmins();
       console.log(`[db] schema ready, ${pruned} expired session(s) pruned`);
       if (promoted > 0) console.log(`[db] promoted ${promoted} account(s) to admin`);
+      void announceDeploy(here).catch(
+        (err) => console.error("[deploy] announce failed:", err.message)
+      );
       setInterval(
         () => {
           pruneSessions().catch((err) => console.error("[db] prune failed:", err.message));
