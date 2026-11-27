@@ -341,14 +341,99 @@ async function pruneSessions() {
 
 // server/ip.ts
 import { isIP } from "node:net";
-var behindCloudflare = !!process.env.RENDER || process.env.TRUST_CF_CONNECTING_IP === "1";
+var CF_V4 = [
+  "173.245.48.0/20",
+  "103.21.244.0/22",
+  "103.22.200.0/22",
+  "103.31.4.0/22",
+  "141.101.64.0/18",
+  "108.162.192.0/18",
+  "190.93.240.0/20",
+  "188.114.96.0/20",
+  "197.234.240.0/22",
+  "198.41.128.0/17",
+  "162.158.0.0/15",
+  "104.16.0.0/13",
+  "104.24.0.0/14",
+  "172.64.0.0/13",
+  "131.0.72.0/22"
+];
+var CF_V6 = [
+  "2400:cb00::/32",
+  "2606:4700::/32",
+  "2803:f800::/32",
+  "2405:b500::/32",
+  "2405:8100::/32",
+  "2a06:98c0::/29",
+  "2c0f:f248::/32"
+];
+function v4ToInt(ip) {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return null;
+  let out = 0n;
+  for (const p of parts) {
+    const n = Number(p);
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+    out = out << 8n | BigInt(n);
+  }
+  return out;
+}
+function v6ToInt(ip) {
+  const bare = ip.split("%")[0];
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(bare);
+  if (mapped) return v4ToInt(mapped[1]);
+  const halves = bare.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const fill = 8 - head.length - tail.length;
+  if (halves.length === 1 && head.length !== 8) return null;
+  if (fill < 0) return null;
+  const groups = [...head, ...Array(halves.length === 2 ? fill : 0).fill("0"), ...tail];
+  if (groups.length !== 8) return null;
+  let out = 0n;
+  for (const g of groups) {
+    if (!/^[0-9a-f]{1,4}$/i.test(g)) return null;
+    out = out << 16n | BigInt(parseInt(g, 16));
+  }
+  return out;
+}
+function toInt(ip) {
+  const kind = isIP(ip);
+  if (kind === 4) {
+    const v = v4ToInt(ip);
+    return v === null ? null : { value: v, bits: 32 };
+  }
+  if (kind === 6) {
+    const v = v6ToInt(ip);
+    if (v === null) return null;
+    return { value: v, bits: /^::ffff:\d+\.\d+\.\d+\.\d+$/i.test(ip) ? 32 : 128 };
+  }
+  return null;
+}
+function inRange(ip, cidr) {
+  const [base, prefixRaw] = cidr.split("/");
+  const prefix = Number(prefixRaw);
+  const a = toInt(ip);
+  const b = toInt(base);
+  if (!a || !b || a.bits !== b.bits || !Number.isInteger(prefix)) return false;
+  const shift = BigInt(a.bits - prefix);
+  return a.value >> shift === b.value >> shift;
+}
+var RANGES = [...CF_V4, ...CF_V6];
+function isCloudflarePeer(ip) {
+  if (!ip) return false;
+  return RANGES.some((cidr) => inRange(ip, cidr));
+}
+var forceTrust = process.env.TRUST_CF_CONNECTING_IP === "1";
 function visitorIp(req) {
-  if (behindCloudflare) {
+  const peer = (req.ip ?? req.socket.remoteAddress ?? "").toString();
+  if (forceTrust || isCloudflarePeer(peer)) {
     const cf = req.headers["cf-connecting-ip"];
     const value = (Array.isArray(cf) ? cf[0] : cf)?.trim();
-    if (value && isIP(value)) return value;
+    if (value && isIP(value)) return value.slice(0, 64);
   }
-  return (req.ip ?? req.socket.remoteAddress ?? "").toString().slice(0, 64);
+  return peer.slice(0, 64);
 }
 
 // shared/countries.ts
@@ -1003,7 +1088,11 @@ async function requireAuth(req, res, next) {
   }
 }
 function requireAdmin(req, res, next) {
-  void requireAuth(req, res, () => {
+  void requireAuth(req, res, (err) => {
+    if (err) {
+      next(err);
+      return;
+    }
     if (req.user?.role !== "admin") {
       res.status(404).json({ ok: false, message: "Not found" });
       return;
@@ -1035,7 +1124,7 @@ async function createPasswordToken(userId, purpose, hours = 72) {
 }
 async function findToken(token) {
   const res = await query(
-    `select t.id, t.user_id, t.purpose, u.email, u.first_name
+    `select t.id, t.user_id, t.purpose, u.email, u.first_name, u.status
        from password_tokens t join users u on u.id = t.user_id
       where t.token_hash = $1 and t.purpose in ('invite', 'reset')
         and t.used_at is null and t.expires_at > now()`,
@@ -1065,10 +1154,15 @@ authRouter.post("/set-password", async (req, res, next) => {
       res.status(400).json({ ok: false, message: "This link has expired or has already been used." });
       return;
     }
+    if (row.status !== "active") {
+      await logEvent("password_set_blocked", row.email, ip);
+      res.status(403).json({ ok: false, message: "This account isn't available. Contact support." });
+      return;
+    }
     const passwordHash = await hashPassword(password);
     await withTransaction(async (client) => {
       await client.query(
-        "update users set password_hash = $1, status = 'active', updated_at = now() where id = $2",
+        "update users set password_hash = $1, updated_at = now() where id = $2",
         [passwordHash, row.user_id]
       );
       await client.query("update password_tokens set used_at = now() where id = $1", [row.id]);
@@ -1450,7 +1544,13 @@ adminRouter.get("/signups", async (req, res, next) => {
     res.json({
       ok: true,
       days: rows.rows.map((r) => ({
-        day: new Date(r.day).toISOString().slice(0, 10),
+        // pg hands back a `date` as local midnight. Running that through
+        // toISOString() shifts it to the previous day on any server west of UTC,
+        // so every bar in the chart was labelled with the wrong date. Read the
+        // local components instead, which is what the column actually means.
+        day: r.day instanceof Date ? `${r.day.getFullYear()}-${String(r.day.getMonth() + 1).padStart(2, "0")}-${String(
+          r.day.getDate()
+        ).padStart(2, "0")}` : String(r.day).slice(0, 10),
         count: Number(r.n)
       }))
     });
@@ -1902,11 +2002,19 @@ adminRouter.post("/ledger/credit", async (req, res, next) => {
       res.status(400).json({ ok: false, message: "Enter a positive amount.", field: "amount" });
       return;
     }
+    if (!reference) {
+      res.status(400).json({
+        ok: false,
+        message: "Enter the transaction reference. It is what stops a deposit being credited twice.",
+        field: "reference"
+      });
+      return;
+    }
     try {
       await query(
         `insert into ledger_entries (user_id, direction, amount, kind, status, reference, note, created_by)
          values ($1, 'credit', $2, 'deposit', 'confirmed', $3, $4, $5)`,
-        [userId, amount.toFixed(2), reference || null, note || null, req.user.id]
+        [userId, amount.toFixed(2), reference, note || null, req.user.id]
       );
     } catch (err) {
       if (err.code === "23505") {
@@ -2305,7 +2413,10 @@ googleRouter.get("/google/start", (req, res) => {
     mode,
     terms: mode === "register" && req.query.terms === "1",
     country: mode === "register" ? clean(req.query.country, 8).toUpperCase() : "",
-    sophisticated: mode === "register" && req.query.sophisticated === "1"
+    sophisticated: mode === "register" && req.query.sophisticated === "1",
+    // Without this, anyone who arrived on a partner's link and then chose Google was
+    // recorded with no referrer, and the partner silently lost the attribution.
+    ref: mode === "register" ? clean(req.query.ref, 16).toUpperCase() : ""
   };
   res.cookie(STATE_COOKIE, b64url(Buffer.from(JSON.stringify(pending))), {
     httpOnly: true,
@@ -2414,15 +2525,28 @@ googleRouter.get("/google/callback", async (req, res) => {
       const last = clean(claims.family_name) || clean(claims.name).split(" ").slice(1).join(" ") || "Customer";
       const inserted = await query(
         `insert into users (email, first_name, last_name, password_hash, terms_accepted_at, signup_ip,
-                            google_sub, email_verified_at, country, sophisticated_at)
-         values ($1, $2, $3, $4, now(), $5, $6, now(), $7, case when $8::boolean then now() else null end)
+                            google_sub, email_verified_at, country, sophisticated_at, referred_by)
+         values ($1, $2, $3, $4, now(), $5, $6, now(), $7, case when $8::boolean then now() else null end, $9)
          returning id, status, google_sub`,
-        [email, first, last, placeholderHash(), ip, sub, pending.country, pending.sophisticated]
+        [
+          email,
+          first,
+          last,
+          placeholderHash(),
+          ip,
+          sub,
+          pending.country,
+          pending.sophisticated,
+          await referrerIdFor(pending.ref)
+        ]
       );
       row = inserted.rows[0];
       if (isListedAdmin(email)) {
         await query("update users set role = 'admin', updated_at = now() where id = $1", [row.id]);
       }
+      void assignReferralCode(row.id).catch(
+        (e) => console.error("[ib] code:", e.message)
+      );
       await logEvent("register", email, ip);
       kind = "google_register";
     }
