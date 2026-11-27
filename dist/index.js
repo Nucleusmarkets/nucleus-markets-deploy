@@ -263,6 +263,18 @@ async function pruneSessions() {
   return res.rowCount ?? 0;
 }
 
+// server/ip.ts
+import { isIP } from "node:net";
+var behindCloudflare = !!process.env.RENDER || process.env.TRUST_CF_CONNECTING_IP === "1";
+function visitorIp(req) {
+  if (behindCloudflare) {
+    const cf = req.headers["cf-connecting-ip"];
+    const value = (Array.isArray(cf) ? cf[0] : cf)?.trim();
+    if (value && isIP(value)) return value;
+  }
+  return (req.ip ?? req.socket.remoteAddress ?? "").toString().slice(0, 64);
+}
+
 // shared/countries.ts
 var COUNTRIES = [
   { code: "AE", name: "United Arab Emirates" },
@@ -607,7 +619,7 @@ function parseName(value, field, label) {
   return name;
 }
 function clientIp(req) {
-  return (req.ip ?? req.socket.remoteAddress ?? "").toString().slice(0, 64);
+  return visitorIp(req);
 }
 async function countEvents(kind, column, value, minutes) {
   const where = column === "ip" ? "ip = $1" : "lower(email) = $1";
@@ -1034,7 +1046,7 @@ import { Router as Router2 } from "express";
 var adminRouter = Router2();
 adminRouter.use(requireAdmin);
 function clientIp2(req) {
-  return (req.ip ?? req.socket.remoteAddress ?? "").toString().slice(0, 64);
+  return visitorIp(req);
 }
 async function record(req, action, targetId, detail) {
   await query(

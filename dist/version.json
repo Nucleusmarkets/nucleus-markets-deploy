@@ -1,6 +1,6 @@
 {
-  "commit": "6166b1b",
-  "subject": "Drop the price ticker from the hero, add the hero video prompt",
-  "body": "The scrolling quote strip showed invented prices under an \"illustrative\"\nlabel on a broker's front page. Removing it loses nothing real and takes a\ndistraction off the first screen.\n\nHero video support was already there; docs/hero-video-prompt.md has the\nGrok Imagine prompt, the framing constraint that keeps the headline\nreadable, and the encode settings.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>",
-  "builtAt": "2026-11-27T07:54:15.806Z"
+  "commit": "892f3de",
+  "subject": "Count sign-up and login limits per visitor, not per Cloudflare server",
+  "body": "Render puts every site behind Cloudflare, so the server was seeing a\nCloudflare address instead of the customer's. That meant the 5-signups-\nan-hour limit and failed-login lockouts were shared by everyone coming\nthrough the same Cloudflare server, so real customers could block each\nother. The server now reads the visitor's real address from the\nCF-Connecting-IP header Cloudflare adds. The sign-in log and back office\nshow real customer addresses from now on.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+  "builtAt": "2026-11-27T07:59:14.523Z"
 }
