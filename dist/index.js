@@ -339,142 +339,6 @@ function needsSophisticatedDeclaration(code) {
   return code === OTHER;
 }
 
-// server/mailer.ts
-var ENDPOINT = "https://api.resend.com/emails";
-function adminRecipients() {
-  return (process.env.ADMIN_EMAILS ?? "").split(",").map((e) => e.trim()).filter(Boolean);
-}
-function mailConfigured() {
-  return Boolean(process.env.RESEND_API_KEY) && adminRecipients().length > 0;
-}
-async function sendMail(opts) {
-  const key = process.env.RESEND_API_KEY;
-  if (!key || opts.to.length === 0) return null;
-  try {
-    const res = await fetch(ENDPOINT, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        from: process.env.MAIL_FROM ?? "Nucleus Markets <support@nucleusmarkets.com>",
-        reply_to: process.env.MAIL_REPLY_TO ?? "support@nucleusmarkets.com",
-        to: opts.to,
-        subject: opts.subject,
-        html: opts.html,
-        text: opts.text
-      })
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      console.error("[mail] send failed:", body.message ?? res.status);
-      return null;
-    }
-    return body.id ?? null;
-  } catch (err) {
-    console.error("[mail] send threw:", err.message);
-    return null;
-  }
-}
-function escapeHtml(s) {
-  return s.replace(
-    /[&<>"']/g,
-    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
-  );
-}
-function shell(opts) {
-  return `<!doctype html>
-<html><body style="margin:0;background:#05060d;font-family:-apple-system,Segoe UI,Inter,Helvetica,Arial,sans-serif;color:#e6e8f2">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#05060d;padding:40px 16px">
-    <tr><td align="center">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#0a0c18;border:1px solid rgba(255,255,255,0.08);border-radius:18px;padding:36px">
-        <tr><td>
-          <p style="margin:0;font-size:12px;letter-spacing:4px;color:#22d3ee;text-transform:uppercase">Nucleus Markets</p>
-          <h1 style="margin:16px 0 0;font-size:25px;line-height:1.25;color:#ffffff;font-weight:600">${opts.title}</h1>
-          <div style="margin:16px 0 0;font-size:15px;line-height:1.65;color:#aab0c6">${opts.body}</div>
-          ${opts.cta ? `<p style="margin:28px 0 0"><a href="${opts.cta.href}" style="display:inline-block;background:#22d3ee;color:#05060d;text-decoration:none;font-weight:600;font-size:15px;padding:14px 26px;border-radius:999px">${opts.cta.label}</a></p>
-          <p style="margin:22px 0 0;font-size:13px;line-height:1.6;color:#6b7391">If the button does not work, paste this into your browser:<br><span style="color:#8fa0bd;word-break:break-all">${opts.cta.href}</span></p>` : ""}
-          <p style="margin:28px 0 0;padding-top:20px;border-top:1px solid rgba(255,255,255,0.08);font-size:13px;line-height:1.6;color:#6b7391">${opts.footer}</p>
-        </td></tr>
-      </table>
-    </td></tr>
-  </table>
-</body></html>`;
-}
-var hello = (name) => name ? `Hi ${escapeHtml(name)},` : "Hi,";
-function verificationEmail(firstName, link) {
-  return {
-    subject: "Confirm your email address",
-    html: shell({
-      title: "Confirm your email",
-      body: `<p style="margin:0">${hello(firstName)}</p><p style="margin:14px 0 0">Confirm this address so we can reach you about your account. The link works once and expires in 24 hours.</p>`,
-      cta: { label: "Confirm my email", href: link },
-      footer: "If you did not open a Nucleus Markets account, ignore this and the link expires on its own."
-    }),
-    text: `${firstName ? `Hi ${firstName},` : "Hi,"}
-
-Confirm your email address (works once, expires in 24 hours):
-${link}
-
-If you did not open a Nucleus Markets account, ignore this.`
-  };
-}
-function resetEmail(firstName, link) {
-  return {
-    subject: "Reset your Nucleus Markets password",
-    html: shell({
-      title: "Reset your password",
-      body: `<p style="margin:0">${hello(firstName)}</p><p style="margin:14px 0 0">Choose a new password using the link below. It works once and expires in 2 hours. Setting a new password signs you out everywhere else.</p>`,
-      cta: { label: "Set a new password", href: link },
-      footer: "If you did not ask for this, you can ignore it - your password has not changed and the link expires on its own."
-    }),
-    text: `${firstName ? `Hi ${firstName},` : "Hi,"}
-
-Reset your password (works once, expires in 2 hours):
-${link}
-
-If you did not ask for this, ignore it - nothing has changed.`
-  };
-}
-function deployEmail(info, site) {
-  const subject = `Nucleus Markets deployed - ${info.subject}`.slice(0, 180);
-  const safeSubject = escapeHtml(info.subject);
-  const safeBody = info.body ? escapeHtml(info.body).replace(/\n/g, "<br>") : "";
-  const when = new Date(info.builtAt ?? Date.now()).toUTCString();
-  const html = `<!doctype html>
-<html><body style="margin:0;background:#05060d;font-family:-apple-system,Segoe UI,Inter,Helvetica,Arial,sans-serif;color:#e6e8f2">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#05060d;padding:40px 16px">
-    <tr><td align="center">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#0a0c18;border:1px solid rgba(255,255,255,0.08);border-radius:18px;padding:32px">
-        <tr><td>
-          <p style="margin:0;font-size:12px;letter-spacing:4px;color:#22d3ee;text-transform:uppercase">Nucleus Markets</p>
-          <h1 style="margin:14px 0 0;font-size:22px;line-height:1.3;color:#ffffff;font-weight:600">${safeSubject}</h1>
-          <p style="margin:10px 0 0;font-size:13px;color:#6b7391">
-            <code style="color:#8fa0bd">${escapeHtml(info.commit)}</code> &middot; ${when}
-          </p>
-          ${safeBody ? `<div style="margin:22px 0 0;padding:16px;background:rgba(255,255,255,0.03);border-radius:12px;font-size:14px;line-height:1.65;color:#aab0c6">${safeBody}</div>` : ""}
-          <p style="margin:26px 0 0">
-            <a href="${site}/admin" style="display:inline-block;background:#22d3ee;color:#05060d;text-decoration:none;font-weight:600;font-size:14px;padding:12px 24px;border-radius:999px">Open the back office</a>
-          </p>
-          <p style="margin:24px 0 0;padding-top:18px;border-top:1px solid rgba(255,255,255,0.08);font-size:12px;line-height:1.6;color:#6b7391">
-            Sent automatically to every admin whenever ${escapeHtml(site.replace(/^https?:\/\//, ""))} is deployed.
-          </p>
-        </td></tr>
-      </table>
-    </td></tr>
-  </table>
-</body></html>`;
-  const text = [
-    "Nucleus Markets - deployed",
-    "",
-    info.subject,
-    `${info.commit} - ${when}`,
-    info.body ? `
-${info.body}` : "",
-    "",
-    `Back office: ${site}/admin`
-  ].join("\n");
-  return { subject, html, text };
-}
-
 // server/auth.ts
 var COOKIE = "ns_session";
 var SESSION_DAYS = 30;
@@ -667,33 +531,11 @@ function requireAdmin(req, res, next) {
   });
 }
 var authRouter = Router();
-function siteUrl() {
-  return (process.env.SITE_URL ?? "https://nucleusmarkets.com").replace(/\/$/, "");
-}
-async function sendVerification(userId, email, firstName) {
-  try {
-    const token = await createPasswordToken(userId, "verify", 24);
-    const mail = verificationEmail(firstName, `${siteUrl()}/verify?token=${token}`);
-    await sendMail({ to: [email], ...mail });
-  } catch (err) {
-    console.error("[auth] verification mail failed:", err.message);
-  }
-}
-async function createPasswordToken(userId, purpose, hours = 72) {
-  const token = randomBytes2(32).toString("base64url");
-  await query(
-    `insert into password_tokens (token_hash, user_id, purpose, expires_at)
-     values ($1, $2, $3, now() + ($4 || ' hours')::interval)`,
-    [hashToken(token), userId, purpose, String(hours)]
-  );
-  return token;
-}
 async function findToken(token) {
   const res = await query(
     `select t.id, t.user_id, t.purpose, u.email, u.first_name
        from password_tokens t join users u on u.id = t.user_id
-      where t.token_hash = $1 and t.purpose in ('invite', 'reset')
-        and t.used_at is null and t.expires_at > now()`,
+      where t.token_hash = $1 and t.used_at is null and t.expires_at > now()`,
     [hashToken(token)]
   );
   return res.rows[0] ?? null;
@@ -794,8 +636,6 @@ authRouter.post("/register", async (req, res, next) => {
       await query("update users set role = 'admin', updated_at = now() where id = $1", [user.id]);
       user.role = "admin";
     }
-    void sendVerification(user.id, email, firstName);
-    await logEvent("verify_sent", email, ip);
     const token = await createSession(user.id, req);
     setSessionCookie(res, token);
     await logEvent("register", email, ip);
@@ -864,85 +704,6 @@ authRouter.post("/login", async (req, res, next) => {
   } catch (err) {
     if (err instanceof Invalid) {
       res.status(400).json({ ok: false, message: err.message, field: err.field });
-      return;
-    }
-    next(err);
-  }
-});
-authRouter.post("/verify", async (req, res, next) => {
-  try {
-    const token = String(req.body?.token ?? "");
-    const found = await query(
-      `select t.id, t.user_id, u.email from password_tokens t join users u on u.id = t.user_id
-        where t.token_hash = $1 and t.purpose = 'verify' and t.used_at is null and t.expires_at > now()`,
-      [hashToken(token)]
-    );
-    const row = found.rows[0];
-    if (!row) {
-      res.status(400).json({ ok: false, message: "This link has expired or has already been used." });
-      return;
-    }
-    await withTransaction(async (client) => {
-      await client.query(
-        "update users set email_verified_at = now(), updated_at = now() where id = $1",
-        [row.user_id]
-      );
-      await client.query("update password_tokens set used_at = now() where id = $1", [row.id]);
-    });
-    await logEvent("email_verified", row.email, clientIp(req));
-    res.json({ ok: true, email: row.email });
-  } catch (err) {
-    next(err);
-  }
-});
-authRouter.post("/resend-verification", requireAuth, async (req, res, next) => {
-  try {
-    const user = req.user;
-    if (user.emailVerified) {
-      res.json({ ok: true, message: "That address is already confirmed." });
-      return;
-    }
-    const ip = clientIp(req);
-    if (await countEvents("verify_sent", "email", user.email, 60) >= 5) {
-      res.status(429).json({ ok: false, message: "Too many emails. Try again in an hour." });
-      return;
-    }
-    await sendVerification(user.id, user.email, user.firstName);
-    await logEvent("verify_sent", user.email, ip);
-    res.json({ ok: true, message: "Sent. Check your inbox." });
-  } catch (err) {
-    next(err);
-  }
-});
-authRouter.post("/forgot", async (req, res, next) => {
-  const ip = clientIp(req);
-  const same = {
-    ok: true,
-    message: "If that address has an account, a reset link is on its way."
-  };
-  try {
-    const email = parseEmail(req.body?.email);
-    if (await countEvents("reset_sent", "ip", ip, 60) >= 5) {
-      await logEvent("reset_throttled", email, ip);
-      res.json(same);
-      return;
-    }
-    const found = await query(
-      "select id, first_name from users where lower(email) = $1 and status = 'active'",
-      [email]
-    );
-    const row = found.rows[0];
-    if (row) {
-      const token = await createPasswordToken(row.id, "reset", 2);
-      const link = `${siteUrl()}/set-password?token=${token}`;
-      const mail = resetEmail(row.first_name, link);
-      await sendMail({ to: [email], ...mail });
-      await logEvent("reset_sent", email, ip);
-    }
-    res.json(same);
-  } catch (err) {
-    if (err instanceof Invalid) {
-      res.json(same);
       return;
     }
     next(err);
@@ -1442,6 +1203,90 @@ googleRouter.get("/google/callback", async (req, res) => {
 // server/deploy-notice.ts
 import fs from "node:fs";
 import path from "node:path";
+
+// server/mailer.ts
+var ENDPOINT = "https://api.resend.com/emails";
+function adminRecipients() {
+  return (process.env.ADMIN_EMAILS ?? "").split(",").map((e) => e.trim()).filter(Boolean);
+}
+function mailConfigured() {
+  return Boolean(process.env.RESEND_API_KEY) && adminRecipients().length > 0;
+}
+async function sendMail(opts) {
+  const key = process.env.RESEND_API_KEY;
+  if (!key || opts.to.length === 0) return null;
+  try {
+    const res = await fetch(ENDPOINT, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        from: process.env.MAIL_FROM ?? "Nucleus Markets <support@nucleusmarkets.com>",
+        reply_to: process.env.MAIL_REPLY_TO ?? "support@nucleusmarkets.com",
+        to: opts.to,
+        subject: opts.subject,
+        html: opts.html,
+        text: opts.text
+      })
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error("[mail] send failed:", body.message ?? res.status);
+      return null;
+    }
+    return body.id ?? null;
+  } catch (err) {
+    console.error("[mail] send threw:", err.message);
+    return null;
+  }
+}
+function escapeHtml(s) {
+  return s.replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
+}
+function deployEmail(info, site) {
+  const subject = `Nucleus Markets deployed - ${info.subject}`.slice(0, 180);
+  const safeSubject = escapeHtml(info.subject);
+  const safeBody = info.body ? escapeHtml(info.body).replace(/\n/g, "<br>") : "";
+  const when = new Date(info.builtAt ?? Date.now()).toUTCString();
+  const html = `<!doctype html>
+<html><body style="margin:0;background:#05060d;font-family:-apple-system,Segoe UI,Inter,Helvetica,Arial,sans-serif;color:#e6e8f2">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#05060d;padding:40px 16px">
+    <tr><td align="center">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#0a0c18;border:1px solid rgba(255,255,255,0.08);border-radius:18px;padding:32px">
+        <tr><td>
+          <p style="margin:0;font-size:12px;letter-spacing:4px;color:#22d3ee;text-transform:uppercase">Nucleus Markets</p>
+          <h1 style="margin:14px 0 0;font-size:22px;line-height:1.3;color:#ffffff;font-weight:600">${safeSubject}</h1>
+          <p style="margin:10px 0 0;font-size:13px;color:#6b7391">
+            <code style="color:#8fa0bd">${escapeHtml(info.commit)}</code> &middot; ${when}
+          </p>
+          ${safeBody ? `<div style="margin:22px 0 0;padding:16px;background:rgba(255,255,255,0.03);border-radius:12px;font-size:14px;line-height:1.65;color:#aab0c6">${safeBody}</div>` : ""}
+          <p style="margin:26px 0 0">
+            <a href="${site}/admin" style="display:inline-block;background:#22d3ee;color:#05060d;text-decoration:none;font-weight:600;font-size:14px;padding:12px 24px;border-radius:999px">Open the back office</a>
+          </p>
+          <p style="margin:24px 0 0;padding-top:18px;border-top:1px solid rgba(255,255,255,0.08);font-size:12px;line-height:1.6;color:#6b7391">
+            Sent automatically to every admin whenever ${escapeHtml(site.replace(/^https?:\/\//, ""))} is deployed.
+          </p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+  const text = [
+    "Nucleus Markets - deployed",
+    "",
+    info.subject,
+    `${info.commit} - ${when}`,
+    info.body ? `
+${info.body}` : "",
+    "",
+    `Back office: ${site}/admin`
+  ].join("\n");
+  return { subject, html, text };
+}
+
+// server/deploy-notice.ts
 async function announceDeploy(dir) {
   const file = path.join(dir, "version.json");
   if (!fs.existsSync(file)) return;
