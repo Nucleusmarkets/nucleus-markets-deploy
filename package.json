@@ -2,11 +2,16 @@
   "name": "nucleus-markets-deploy",
   "private": true,
   "type": "module",
-  "scripts": { "start": "node dist/index.js" },
-  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node dist/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "compression": "^1.7.5",
     "express": "^4.21.2",
-    "helmet": "^8.1.0"
+    "helmet": "^8.1.0",
+    "pg": "^8.13.1"
   }
 }
