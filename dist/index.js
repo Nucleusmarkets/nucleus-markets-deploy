@@ -230,6 +230,78 @@ var statements = [
   // registration; the unique index is what actually guarantees no collision.
   `update users set referral_code = upper(substr(md5(random()::text || id::text), 1, 8))
      where referral_code is null`,
+  // ------------------------------------------------------------------------ KYC
+  /*
+   * Documents live in Postgres. The instance has 15 GB of disk against a few MB in
+   * use, which is thousands of documents, and unlike a container filesystem the
+   * bytes survive a redeploy. `storage` and `storage_ref` are here so a move to
+   * object storage later is a backfill rather than a schema change.
+   */
+  `create table if not exists kyc_documents (
+     id          bigserial primary key,
+     user_id     bigint      not null references users (id) on delete cascade,
+     kind        text        not null,
+     filename    text        not null,
+     mime        text        not null,
+     bytes       integer     not null,
+     storage     text        not null default 'postgres',
+     storage_ref text,
+     content     bytea,
+     status      text        not null default 'pending',
+     note        text,
+     uploaded_at timestamptz not null default now(),
+     reviewed_at timestamptz,
+     reviewed_by bigint      references users (id)
+   )`,
+  `create index if not exists kyc_documents_user_idx on kyc_documents (user_id, uploaded_at desc)`,
+  `create index if not exists kyc_documents_status_idx on kyc_documents (status, uploaded_at)`,
+  // The customer's overall standing, separate from any single document.
+  `alter table users add column if not exists kyc_status text not null default 'not_started'`,
+  `alter table users add column if not exists kyc_reviewed_at timestamptz`,
+  // ----------------------------------------------------------------- the ledger
+  /*
+   * Every movement of customer money, append-only. A balance is always derived by
+   * summing this table and never stored on the user row, so there is no second
+   * number that can drift out of agreement with the history.
+   *
+   * Only 'confirmed' rows count. A deposit that was seen but not confirmed, and a
+   * withdrawal still being reviewed, must never show up as spendable balance - that
+   * is exactly how a sibling brand credited ~$64k that never arrived.
+   */
+  `create table if not exists ledger_entries (
+     id          bigserial primary key,
+     user_id     bigint      not null references users (id) on delete cascade,
+     direction   text        not null check (direction in ('credit', 'debit')),
+     amount      numeric(16,2) not null check (amount > 0),
+     currency    text        not null default 'USD',
+     kind        text        not null,
+     status      text        not null default 'confirmed' check (status in ('pending', 'confirmed', 'reversed')),
+     reference   text,
+     note        text,
+     created_by  bigint      references users (id),
+     created_at  timestamptz not null default now()
+   )`,
+  `create index if not exists ledger_user_idx on ledger_entries (user_id, created_at desc)`,
+  `create index if not exists ledger_status_idx on ledger_entries (status)`,
+  // An external reference (a transaction hash, a payment id) can only be credited
+  // once. This is the database-level guard against crediting the same deposit twice.
+  `create unique index if not exists ledger_reference_key on ledger_entries (reference)
+     where reference is not null and status <> 'reversed'`,
+  `create table if not exists withdrawal_requests (
+     id           bigserial primary key,
+     user_id      bigint      not null references users (id) on delete cascade,
+     amount       numeric(16,2) not null check (amount > 0),
+     currency     text        not null default 'USD',
+     destination  text        not null,
+     status       text        not null default 'requested',
+     requested_at timestamptz not null default now(),
+     decided_at   timestamptz,
+     decided_by   bigint      references users (id),
+     decided_note text,
+     ledger_id    bigint      references ledger_entries (id)
+   )`,
+  `create index if not exists withdrawals_user_idx on withdrawal_requests (user_id, requested_at desc)`,
+  `create index if not exists withdrawals_status_idx on withdrawal_requests (status, requested_at)`,
   // One row per deployed build. The unique commit is what stops a restart, a second
   // instance or a rollback from emailing the admins about the same build twice.
   `create table if not exists deploys (
@@ -436,8 +508,8 @@ async function assignReferralCode(userId) {
   }
   throw new Error("could not allocate a referral code");
 }
-async function referrerIdFor(raw) {
-  const value = typeof raw === "string" ? raw.trim().toUpperCase().slice(0, 16) : "";
+async function referrerIdFor(raw2) {
+  const value = typeof raw2 === "string" ? raw2.trim().toUpperCase().slice(0, 16) : "";
   if (!value) return null;
   const res = await query(
     "select id from users where referral_code = $1 and status = 'active'",
@@ -1258,6 +1330,69 @@ authRouter.post("/logout-all", requireAuth, async (req, res, next) => {
 
 // server/admin.ts
 import { Router as Router3 } from "express";
+
+// server/platform.ts
+var ENV = {
+  base: process.env.TRADELOCKER_API_URL ?? "",
+  email: process.env.TRADELOCKER_EMAIL ?? "",
+  password: process.env.TRADELOCKER_PASSWORD ?? "",
+  server: process.env.TRADELOCKER_SERVER ?? ""
+};
+var TradeLocker = class {
+  name = "TradeLocker";
+  get configured() {
+    return Boolean(ENV.base && ENV.email && ENV.password && ENV.server);
+  }
+  token = null;
+  /** Cached because TradeLocker rate-limits auth far harder than it does reads. */
+  async authenticate() {
+    if (this.token && this.token.expires > Date.now() + 3e4) return this.token.value;
+    const res = await fetch(`${ENV.base.replace(/\/$/, "")}/auth/jwt/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ email: ENV.email, password: ENV.password, server: ENV.server })
+    });
+    if (!res.ok) throw new Error(`auth failed: HTTP ${res.status}`);
+    const body = await res.json();
+    if (!body.accessToken) throw new Error("auth response had no accessToken");
+    this.token = {
+      value: body.accessToken,
+      expires: Date.now() + (body.expiresIn ? body.expiresIn * 1e3 : 10 * 6e4)
+    };
+    return this.token.value;
+  }
+  async check() {
+    if (!this.configured) {
+      return { ok: false, detail: "No credentials set (TRADELOCKER_API_URL, _EMAIL, _PASSWORD, _SERVER)" };
+    }
+    try {
+      await this.authenticate();
+      return { ok: true, detail: `Authenticated against ${ENV.server}` };
+    } catch (err) {
+      return { ok: false, detail: err.message };
+    }
+  }
+};
+var NoPlatform = class {
+  name = "none";
+  configured = false;
+  async check() {
+    return { ok: false, detail: "No trading platform configured" };
+  }
+};
+var platform = ENV.base ? new TradeLocker() : new NoPlatform();
+async function platformStatus() {
+  const result = await platform.check();
+  return {
+    name: platform.name,
+    configured: platform.configured,
+    // Never claims a live connection the check did not actually make.
+    reachable: result.ok,
+    detail: result.detail
+  };
+}
+
+// server/admin.ts
 var adminRouter = Router3();
 adminRouter.use(requireAdmin);
 function clientIp2(req) {
@@ -1650,6 +1785,220 @@ adminRouter.post("/payouts/:id/decide", async (req, res, next) => {
     next(err);
   }
 });
+adminRouter.get("/kyc", async (req, res, next) => {
+  try {
+    const status = typeof req.query.status === "string" ? req.query.status.slice(0, 20) : "pending";
+    const rows = await query(
+      `select d.id, d.kind, d.filename, d.mime, d.bytes, d.status, d.note, d.uploaded_at,
+              u.id as user_id, u.email, u.first_name, u.last_name, u.country, u.kyc_status
+         from kyc_documents d join users u on u.id = d.user_id
+        where ($1::text = '' or d.status = $1)
+        order by d.uploaded_at asc limit 200`,
+      [status]
+    );
+    res.json({
+      ok: true,
+      documents: rows.rows.map((d) => ({
+        id: String(d.id),
+        userId: String(d.user_id),
+        email: d.email,
+        name: `${d.first_name ?? ""} ${d.last_name ?? ""}`.trim(),
+        country: d.country,
+        customerStatus: d.kyc_status,
+        kind: d.kind,
+        filename: d.filename,
+        mime: d.mime,
+        bytes: Number(d.bytes),
+        status: d.status,
+        note: d.note,
+        uploadedAt: new Date(d.uploaded_at).toISOString()
+      }))
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+adminRouter.get("/kyc/:id/file", async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    if (!/^\d+$/.test(id)) {
+      res.status(400).json({ ok: false, message: "Bad id." });
+      return;
+    }
+    const found = await query(
+      "select content, mime, filename from kyc_documents where id = $1",
+      [id]
+    );
+    const row = found.rows[0];
+    if (!row?.content) {
+      res.status(404).json({ ok: false, message: "No such document." });
+      return;
+    }
+    res.setHeader("Content-Type", row.mime);
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Content-Disposition", `inline; filename="${row.filename.replace(/"/g, "")}"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.send(row.content);
+  } catch (err) {
+    next(err);
+  }
+});
+adminRouter.post("/kyc/:id/decide", async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const status = String(req.body?.status ?? "");
+    const note = String(req.body?.note ?? "").trim().slice(0, 300);
+    if (!/^\d+$/.test(id) || status !== "approved" && status !== "rejected") {
+      res.status(400).json({ ok: false, message: "Decision must be approved or rejected." });
+      return;
+    }
+    const out = await withTransaction(async (client) => {
+      const doc = await client.query(
+        `update kyc_documents set status = $1, note = $2, reviewed_at = now(), reviewed_by = $3
+          where id = $4 and status = 'pending'
+          returning user_id, (select email from users where id = user_id) as email`,
+        [status, note || null, req.user.id, id]
+      );
+      if (doc.rowCount === 0) return null;
+      const userId = doc.rows[0].user_id;
+      const tally = await client.query(
+        `select count(*) filter (where status = 'pending')::text  as pending,
+                count(*) filter (where status = 'rejected')::text as rejected,
+                count(*) filter (where status = 'approved')::text as approved
+           from kyc_documents where user_id = $1`,
+        [userId]
+      );
+      const t = tally.rows[0];
+      const next2 = Number(t.rejected) > 0 ? "rejected" : Number(t.pending) > 0 ? "pending" : Number(t.approved) > 0 ? "approved" : "not_started";
+      await client.query(
+        "update users set kyc_status = $1, kyc_reviewed_at = now(), updated_at = now() where id = $2",
+        [next2, userId]
+      );
+      return { userId, email: doc.rows[0].email, next: next2 };
+    });
+    if (!out) {
+      res.status(409).json({ ok: false, message: "That document has already been reviewed." });
+      return;
+    }
+    await record(req, `kyc:${status}`, out.userId, `${out.email} -> ${out.next}`);
+    res.json({ ok: true, customerStatus: out.next });
+  } catch (err) {
+    next(err);
+  }
+});
+adminRouter.post("/ledger/credit", async (req, res, next) => {
+  try {
+    const userId = String(req.body?.userId ?? "");
+    const amount = Number(req.body?.amount);
+    const reference = String(req.body?.reference ?? "").trim().slice(0, 200);
+    const note = String(req.body?.note ?? "").trim().slice(0, 300);
+    if (!/^\d+$/.test(userId)) {
+      res.status(400).json({ ok: false, message: "Pick a customer." });
+      return;
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      res.status(400).json({ ok: false, message: "Enter a positive amount.", field: "amount" });
+      return;
+    }
+    try {
+      await query(
+        `insert into ledger_entries (user_id, direction, amount, kind, status, reference, note, created_by)
+         values ($1, 'credit', $2, 'deposit', 'confirmed', $3, $4, $5)`,
+        [userId, amount.toFixed(2), reference || null, note || null, req.user.id]
+      );
+    } catch (err) {
+      if (err.code === "23505") {
+        res.status(409).json({
+          ok: false,
+          message: "That reference has already been credited. Nothing was added.",
+          field: "reference"
+        });
+        return;
+      }
+      throw err;
+    }
+    await record(req, "ledger:credit", userId, `${amount.toFixed(2)}${reference ? ` ref ${reference}` : ""}`);
+    res.status(201).json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+adminRouter.get("/withdrawals", async (req, res, next) => {
+  try {
+    const status = typeof req.query.status === "string" ? req.query.status.slice(0, 20) : "";
+    const rows = await query(
+      `select w.id, w.amount::text, w.destination, w.status, w.decided_note,
+              w.requested_at, w.decided_at, u.email, u.id as user_id, u.kyc_status
+         from withdrawal_requests w join users u on u.id = w.user_id
+        where ($1::text = '' or w.status = $1)
+        order by case when w.status = 'requested' then 0 else 1 end, w.requested_at desc
+        limit 200`,
+      [status]
+    );
+    res.json({
+      ok: true,
+      withdrawals: rows.rows.map((w) => ({
+        id: String(w.id),
+        userId: String(w.user_id),
+        email: w.email,
+        kycStatus: w.kyc_status,
+        amount: Number(w.amount),
+        destination: w.destination,
+        status: w.status,
+        decidedNote: w.decided_note,
+        requestedAt: new Date(w.requested_at).toISOString(),
+        decidedAt: w.decided_at ? new Date(w.decided_at).toISOString() : null
+      }))
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+adminRouter.post("/withdrawals/:id/decide", async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const status = String(req.body?.status ?? "");
+    const note = String(req.body?.note ?? "").trim().slice(0, 300);
+    if (!/^\d+$/.test(id) || status !== "sent" && status !== "rejected") {
+      res.status(400).json({ ok: false, message: "Decision must be sent or rejected." });
+      return;
+    }
+    const out = await withTransaction(async (client) => {
+      const row = await client.query(
+        `update withdrawal_requests w set status = $1, decided_at = now(), decided_by = $2, decided_note = $3
+           from users u
+          where w.id = $4 and w.status = 'requested' and u.id = w.user_id
+          returning w.user_id, w.amount::text, u.email, w.ledger_id`,
+        [status, req.user.id, note || null, id]
+      );
+      if (row.rowCount === 0) return null;
+      const r = row.rows[0];
+      if (status === "rejected") {
+        await client.query(
+          `insert into ledger_entries (user_id, direction, amount, kind, status, note, created_by)
+           values ($1, 'credit', $2, 'withdrawal_reversal', 'confirmed', 'withdrawal rejected', $3)`,
+          [r.user_id, r.amount, req.user.id]
+        );
+      }
+      return r;
+    });
+    if (!out) {
+      res.status(409).json({ ok: false, message: "That request has already been decided." });
+      return;
+    }
+    await record(req, `withdrawal:${status}`, out.user_id, `${out.amount} to ${out.email}`);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+adminRouter.get("/platform", async (_req, res, next) => {
+  try {
+    res.json({ ok: true, platform: await platformStatus() });
+  } catch (err) {
+    next(err);
+  }
+});
 adminRouter.get("/actions", async (req, res, next) => {
   try {
     const limit = Math.min(Math.max(Number(req.query.limit) || 60, 1), 300);
@@ -1676,9 +2025,237 @@ adminRouter.get("/actions", async (req, res, next) => {
   }
 });
 
+// server/money.ts
+import { Router as Router4, raw } from "express";
+var MAX_BYTES = 6 * 1024 * 1024;
+var MAX_PER_CUSTOMER = 6;
+var KINDS = /* @__PURE__ */ new Set(["id_front", "id_back", "passport", "proof_of_address", "selfie"]);
+function sniff(buf) {
+  if (buf.length < 12) return null;
+  if (buf[0] === 255 && buf[1] === 216 && buf[2] === 255) return { mime: "image/jpeg", ext: "jpg" };
+  if (buf.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return { mime: "image/png", ext: "png" };
+  }
+  if (buf.subarray(0, 4).toString("latin1") === "%PDF") return { mime: "application/pdf", ext: "pdf" };
+  if (buf.subarray(0, 4).toString("latin1") === "RIFF" && buf.subarray(8, 12).toString("latin1") === "WEBP") {
+    return { mime: "image/webp", ext: "webp" };
+  }
+  return null;
+}
+function safeName(raw2, ext) {
+  const base = typeof raw2 === "string" ? raw2 : "";
+  const cleaned = base.replace(/[\u0000-\u001f]/g, "").replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "").slice(0, 80);
+  return cleaned || `document.${ext}`;
+}
+var kycRouter = Router4();
+kycRouter.use(requireAuth);
+kycRouter.get("/", async (req, res, next) => {
+  try {
+    const me = req.user;
+    const status = await query(
+      "select kyc_status from users where id = $1",
+      [me.id]
+    );
+    const docs = await query(
+      `select id, kind, filename, mime, bytes, status, note, uploaded_at
+         from kyc_documents where user_id = $1 order by uploaded_at desc`,
+      [me.id]
+    );
+    res.json({
+      ok: true,
+      status: status.rows[0]?.kyc_status ?? "not_started",
+      documents: docs.rows.map((d) => ({
+        id: String(d.id),
+        kind: d.kind,
+        filename: d.filename,
+        mime: d.mime,
+        bytes: Number(d.bytes),
+        status: d.status,
+        note: d.note,
+        uploadedAt: new Date(d.uploaded_at).toISOString()
+      }))
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+kycRouter.post(
+  "/documents",
+  raw({ type: ["image/*", "application/pdf", "application/octet-stream"], limit: MAX_BYTES }),
+  async (req, res, next) => {
+    try {
+      const me = req.user;
+      const kind = String(req.query.kind ?? "");
+      if (!KINDS.has(kind)) {
+        res.status(400).json({ ok: false, message: "Pick what this document is." });
+        return;
+      }
+      const body = req.body;
+      if (!Buffer.isBuffer(body) || body.length === 0) {
+        res.status(400).json({ ok: false, message: "That file came through empty." });
+        return;
+      }
+      const kindOf = sniff(body);
+      if (!kindOf) {
+        res.status(400).json({ ok: false, message: "Upload a JPEG, PNG, WebP or PDF." });
+        return;
+      }
+      const count = await query(
+        "select count(*)::text as n from kyc_documents where user_id = $1 and status <> 'rejected'",
+        [me.id]
+      );
+      if (Number(count.rows[0]?.n ?? 0) >= MAX_PER_CUSTOMER) {
+        res.status(400).json({
+          ok: false,
+          message: "You've uploaded enough documents. Contact support if you need to replace one."
+        });
+        return;
+      }
+      const row = await withTransaction(async (client) => {
+        const inserted = await client.query(
+          `insert into kyc_documents (user_id, kind, filename, mime, bytes, content)
+           values ($1, $2, $3, $4, $5, $6) returning id`,
+          [me.id, kind, safeName(req.query.filename, kindOf.ext), kindOf.mime, body.length, body]
+        );
+        await client.query(
+          `update users set kyc_status = case when kyc_status = 'approved' then 'approved' else 'pending' end,
+                            updated_at = now()
+            where id = $1`,
+          [me.id]
+        );
+        return inserted.rows[0];
+      });
+      res.status(201).json({ ok: true, id: String(row.id) });
+    } catch (err) {
+      if (err.type === "entity.too.large") {
+        res.status(413).json({ ok: false, message: "That file is too big. Keep it under 6 MB." });
+        return;
+      }
+      next(err);
+    }
+  }
+);
+async function balanceFor2(userId) {
+  const res = await query(
+    `select
+       coalesce(sum(amount) filter (where direction = 'credit' and status = 'confirmed'), 0)::text as credits,
+       coalesce(sum(amount) filter (where direction = 'debit'  and status = 'confirmed'), 0)::text as debits,
+       coalesce(sum(amount) filter (where direction = 'credit' and status = 'pending'), 0)::text as incoming
+       from ledger_entries where user_id = $1`,
+    [userId]
+  );
+  const row = res.rows[0] ?? {};
+  const credits = Number(row.credits ?? 0);
+  const debits = Number(row.debits ?? 0);
+  return {
+    balance: credits - debits,
+    pendingIn: Number(row.incoming ?? 0)
+  };
+}
+var walletRouter = Router4();
+walletRouter.use(requireAuth);
+walletRouter.get("/", async (req, res, next) => {
+  try {
+    const me = req.user;
+    const entries = await query(
+      `select id, direction, amount::text, currency, kind, status, reference, note, created_at
+         from ledger_entries where user_id = $1 order by created_at desc limit 100`,
+      [me.id]
+    );
+    const withdrawals = await query(
+      `select id, amount::text, destination, status, decided_note, requested_at, decided_at
+         from withdrawal_requests where user_id = $1 order by requested_at desc limit 50`,
+      [me.id]
+    );
+    res.json({
+      ok: true,
+      ...await balanceFor2(me.id),
+      entries: entries.rows.map((e) => ({
+        id: String(e.id),
+        direction: e.direction,
+        amount: Number(e.amount),
+        currency: e.currency,
+        kind: e.kind,
+        status: e.status,
+        reference: e.reference,
+        note: e.note,
+        at: new Date(e.created_at).toISOString()
+      })),
+      withdrawals: withdrawals.rows.map((w) => ({
+        id: String(w.id),
+        amount: Number(w.amount),
+        destination: w.destination,
+        status: w.status,
+        decidedNote: w.decided_note,
+        requestedAt: new Date(w.requested_at).toISOString(),
+        decidedAt: w.decided_at ? new Date(w.decided_at).toISOString() : null
+      }))
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+walletRouter.post("/withdrawals", async (req, res, next) => {
+  try {
+    const me = req.user;
+    const amount = Number(req.body?.amount);
+    const destination = String(req.body?.destination ?? "").trim().slice(0, 200);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      res.status(400).json({ ok: false, message: "Enter an amount.", field: "amount" });
+      return;
+    }
+    if (!destination) {
+      res.status(400).json({ ok: false, message: "Where should it be sent?", field: "destination" });
+      return;
+    }
+    const who = await query("select kyc_status from users where id = $1", [me.id]);
+    if (who.rows[0]?.kyc_status !== "approved") {
+      res.status(403).json({
+        ok: false,
+        message: "We need your identity check approved before a withdrawal can be sent."
+      });
+      return;
+    }
+    const out = await withTransaction(async (client) => {
+      await client.query("select id from users where id = $1 for update", [me.id]);
+      const sums = await client.query(
+        `select
+           coalesce(sum(amount) filter (where direction = 'credit' and status = 'confirmed'), 0)::text as c,
+           coalesce(sum(amount) filter (where direction = 'debit'  and status = 'confirmed'), 0)::text as d
+           from ledger_entries where user_id = $1`,
+        [me.id]
+      );
+      const available = Number(sums.rows[0].c) - Number(sums.rows[0].d);
+      if (amount > available + 1e-9) return { tooMuch: true, available };
+      const entry = await client.query(
+        `insert into ledger_entries (user_id, direction, amount, kind, status, note)
+         values ($1, 'debit', $2, 'withdrawal', 'confirmed', 'withdrawal requested') returning id`,
+        [me.id, amount.toFixed(2)]
+      );
+      const req_ = await client.query(
+        `insert into withdrawal_requests (user_id, amount, destination, ledger_id)
+         values ($1, $2, $3, $4) returning id`,
+        [me.id, amount.toFixed(2), destination, entry.rows[0].id]
+      );
+      return { tooMuch: false, id: req_.rows[0].id };
+    });
+    if (out.tooMuch) {
+      res.status(400).json({
+        ok: false,
+        message: `Your available balance is ${out.available.toFixed(2)}.`,
+        field: "amount"
+      });
+      return;
+    }
+    res.status(201).json({ ok: true, id: out.id });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // server/google.ts
 import { createHash as createHash2, randomBytes as randomBytes4, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
-import { Router as Router4 } from "express";
+import { Router as Router5 } from "express";
 var CLIENT_ID = process.env.GOOGLE_CLIENT_ID ?? "";
 var CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET ?? "";
 var SITE = (process.env.SITE_URL ?? "https://nucleusmarkets.com").replace(/\/+$/, "");
@@ -1716,7 +2293,7 @@ function readIdToken(idToken) {
 }
 var clean = (v, max2 = 80) => typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, max2) : "";
 var placeholderHash = () => `scrypt$16384$8$1$${randomBytes4(16).toString("base64")}$${randomBytes4(64).toString("base64")}`;
-var googleRouter = Router4();
+var googleRouter = Router5();
 googleRouter.get("/google/start", (req, res) => {
   const mode = req.query.mode === "register" ? "register" : "login";
   if (!googleEnabled) return fail(res, mode, "off");
@@ -1752,11 +2329,11 @@ googleRouter.get("/google/start", (req, res) => {
 });
 googleRouter.get("/google/callback", async (req, res) => {
   const ip = clientIp(req);
-  const raw = readCookie(req, STATE_COOKIE);
+  const raw2 = readCookie(req, STATE_COOKIE);
   clearState(res);
   let pending = null;
   try {
-    pending = raw ? JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) : null;
+    pending = raw2 ? JSON.parse(Buffer.from(raw2, "base64url").toString("utf8")) : null;
   } catch {
     pending = null;
   }
@@ -1941,6 +2518,8 @@ if (dbConfigured) {
   app.use("/api/auth", authRouter);
   app.use("/api/admin", adminRouter);
   app.use("/api/ib", ibRouter);
+  app.use("/api/kyc", kycRouter);
+  app.use("/api/wallet", walletRouter);
 } else {
   app.use("/api/auth", (_req, res) => {
     res.status(503).json({
