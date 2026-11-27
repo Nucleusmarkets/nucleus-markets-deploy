@@ -7,8 +7,8 @@ import fs2 from "node:fs";
 import { fileURLToPath } from "node:url";
 
 // server/auth.ts
-import { createHash, randomBytes as randomBytes2 } from "node:crypto";
-import { Router } from "express";
+import { createHash, randomBytes as randomBytes3 } from "node:crypto";
+import { Router as Router2 } from "express";
 
 // server/db.ts
 import pg from "pg";
@@ -226,6 +226,10 @@ var statements = [
   `insert into commission_plans (name, per_lot, revenue_pct, is_default)
      values ('Standard IB', 3.0000, 0, true)
      on conflict (name) do nothing`,
+  // Backfill codes for accounts that predate referrals. New accounts get theirs at
+  // registration; the unique index is what actually guarantees no collision.
+  `update users set referral_code = upper(substr(md5(random()::text || id::text), 1, 8))
+     where referral_code is null`,
   // One row per deployed build. The unique commit is what stops a restart, a second
   // instance or a rollback from emailing the admins about the same build twice.
   `create table if not exists deploys (
@@ -393,12 +397,220 @@ var COUNTRIES = [
 ];
 var OTHER = "OTHER";
 var BY_CODE = new Map(COUNTRIES.map((c) => [c.code, c]));
-function isValidCountry(code) {
-  return BY_CODE.has(code);
+function isValidCountry(code2) {
+  return BY_CODE.has(code2);
 }
-function needsSophisticatedDeclaration(code) {
-  return code === OTHER;
+function needsSophisticatedDeclaration(code2) {
+  return code2 === OTHER;
 }
+
+// server/ib.ts
+import { randomBytes as randomBytes2 } from "node:crypto";
+import { Router } from "express";
+var ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+function code(length = 8) {
+  const bytes = randomBytes2(length);
+  let out = "";
+  for (let i = 0; i < length; i++) out += ALPHABET[bytes[i] % ALPHABET.length];
+  return out;
+}
+async function assignReferralCode(userId) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const candidate = code();
+    try {
+      const res = await query(
+        "update users set referral_code = $1 where id = $2 and referral_code is null returning referral_code",
+        [candidate, userId]
+      );
+      if (res.rowCount === 0) {
+        const existing = await query(
+          "select referral_code from users where id = $1",
+          [userId]
+        );
+        return existing.rows[0]?.referral_code ?? candidate;
+      }
+      return candidate;
+    } catch (err) {
+      if (err.code !== "23505") throw err;
+    }
+  }
+  throw new Error("could not allocate a referral code");
+}
+async function referrerIdFor(raw) {
+  const value = typeof raw === "string" ? raw.trim().toUpperCase().slice(0, 16) : "";
+  if (!value) return null;
+  const res = await query(
+    "select id from users where referral_code = $1 and status = 'active'",
+    [value]
+  );
+  return res.rows[0]?.id ?? null;
+}
+async function balanceFor(ibId) {
+  const res = await query(
+    `select
+       coalesce((select sum(amount) from commissions where ib_id = $1), 0)::text as earned,
+       coalesce((select sum(amount) from payout_requests where ib_id = $1 and status = 'paid'), 0)::text as paid,
+       coalesce((select sum(amount) from payout_requests where ib_id = $1 and status = 'requested'), 0)::text as requested`,
+    [ibId]
+  );
+  const row = res.rows[0] ?? {};
+  const earned = Number(row.earned ?? 0);
+  const paid = Number(row.paid ?? 0);
+  const requested = Number(row.requested ?? 0);
+  return {
+    earned,
+    paid,
+    requested,
+    available: Math.max(earned - paid - requested, 0)
+  };
+}
+var ibRouter = Router();
+ibRouter.use(requireAuth);
+ibRouter.get("/overview", async (req, res, next) => {
+  try {
+    const me = req.user;
+    const info = await query(
+      `select u.referral_code, u.ib_approved_at,
+              (select count(*) from users r where r.referred_by = u.id)::text as n
+         from users u where u.id = $1`,
+      [me.id]
+    );
+    const row = info.rows[0];
+    let referralCode = row?.referral_code ?? null;
+    if (!referralCode) referralCode = await assignReferralCode(me.id);
+    res.json({
+      ok: true,
+      ib: {
+        referralCode,
+        link: `${siteUrl()}/r/${referralCode}`,
+        approved: row?.ib_approved_at !== null && row?.ib_approved_at !== void 0,
+        referrals: Number(row?.n ?? 0),
+        ...await balanceFor(me.id)
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+ibRouter.get("/referrals", async (req, res, next) => {
+  try {
+    const rows = await query(
+      `select id, first_name, left(email, 2) as hint, country, created_at, status
+         from users where referred_by = $1 order by created_at desc limit 200`,
+      [req.user.id]
+    );
+    res.json({
+      ok: true,
+      referrals: rows.rows.map((r) => ({
+        id: String(r.id),
+        name: r.first_name || `${r.hint}***`,
+        country: r.country ?? null,
+        status: r.status,
+        joinedAt: new Date(r.created_at).toISOString()
+      }))
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+ibRouter.get("/commissions", async (req, res, next) => {
+  try {
+    const rows = await query(
+      `select amount::text, source, note, created_at from commissions
+        where ib_id = $1 order by created_at desc limit 100`,
+      [req.user.id]
+    );
+    res.json({
+      ok: true,
+      commissions: rows.rows.map((r) => ({
+        amount: Number(r.amount),
+        source: r.source,
+        note: r.note,
+        at: new Date(r.created_at).toISOString()
+      }))
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+ibRouter.get("/payouts", async (req, res, next) => {
+  try {
+    const rows = await query(
+      `select id, amount::text, destination, status, note, decided_note, requested_at, decided_at
+         from payout_requests where ib_id = $1 order by requested_at desc limit 100`,
+      [req.user.id]
+    );
+    res.json({
+      ok: true,
+      payouts: rows.rows.map((r) => ({
+        id: String(r.id),
+        amount: Number(r.amount),
+        destination: r.destination,
+        status: r.status,
+        note: r.note,
+        decidedNote: r.decided_note,
+        requestedAt: new Date(r.requested_at).toISOString(),
+        decidedAt: r.decided_at ? new Date(r.decided_at).toISOString() : null
+      }))
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+ibRouter.post("/payouts", async (req, res, next) => {
+  try {
+    const me = req.user;
+    const approved = await query(
+      "select ib_approved_at from users where id = $1",
+      [me.id]
+    );
+    if (!approved.rows[0]?.ib_approved_at) {
+      res.status(403).json({ ok: false, message: "Your partner account isn't approved yet." });
+      return;
+    }
+    const amount = Number(req.body?.amount);
+    const destination = String(req.body?.destination ?? "").trim().slice(0, 200);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      res.status(400).json({ ok: false, message: "Enter an amount.", field: "amount" });
+      return;
+    }
+    if (!destination) {
+      res.status(400).json({ ok: false, message: "Where should it be sent?", field: "destination" });
+      return;
+    }
+    const created = await withTransaction(async (client) => {
+      await client.query("select id from users where id = $1 for update", [me.id]);
+      const sums = await client.query(
+        `select
+           coalesce((select sum(amount) from commissions where ib_id = $1), 0)::text as earned,
+           coalesce((select sum(amount) from payout_requests where ib_id = $1 and status = 'paid'), 0)::text as paid,
+           coalesce((select sum(amount) from payout_requests where ib_id = $1 and status = 'requested'), 0)::text as requested`,
+        [me.id]
+      );
+      const s = sums.rows[0];
+      const available = Number(s.earned) - Number(s.paid) - Number(s.requested);
+      if (amount > available + 1e-9) {
+        return { tooMuch: true, available };
+      }
+      const row = await client.query(
+        `insert into payout_requests (ib_id, amount, destination) values ($1, $2, $3) returning id`,
+        [me.id, amount.toFixed(2), destination]
+      );
+      return { tooMuch: false, id: row.rows[0].id };
+    });
+    if (created.tooMuch) {
+      res.status(400).json({
+        ok: false,
+        message: `You can request up to ${created.available.toFixed(2)} right now.`,
+        field: "amount"
+      });
+      return;
+    }
+    res.status(201).json({ ok: true, id: created.id });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // server/mailer.ts
 var ENDPOINT = "https://api.resend.com/emails";
@@ -665,7 +877,7 @@ function clearSessionCookie(res) {
   res.clearCookie(COOKIE, { httpOnly: true, secure: isProd, sameSite: "lax", path: "/" });
 }
 async function createSession(userId, req) {
-  const token = randomBytes2(32).toString("base64url");
+  const token = randomBytes3(32).toString("base64url");
   await query(
     `insert into sessions (token_hash, user_id, expires_at, ip, user_agent)
      values ($1, $2, now() + ($3 || ' days')::interval, $4, $5)`,
@@ -727,7 +939,7 @@ function requireAdmin(req, res, next) {
     next();
   });
 }
-var authRouter = Router();
+var authRouter = Router2();
 function siteUrl() {
   return (process.env.SITE_URL ?? "https://nucleusmarkets.com").replace(/\/$/, "");
 }
@@ -741,7 +953,7 @@ async function sendVerification(userId, email, firstName) {
   }
 }
 async function createPasswordToken(userId, purpose, hours = 72) {
-  const token = randomBytes2(32).toString("base64url");
+  const token = randomBytes3(32).toString("base64url");
   await query(
     `insert into password_tokens (token_hash, user_id, purpose, expires_at)
      values ($1, $2, $3, now() + ($4 || ' hours')::interval)`,
@@ -842,12 +1054,14 @@ authRouter.post("/register", async (req, res, next) => {
       return;
     }
     const passwordHash = await hashPassword(password);
+    const referredBy = await referrerIdFor(req.body?.ref);
     const user = await withTransaction(async (client) => {
       const inserted = await client.query(
-        `insert into users (email, first_name, last_name, password_hash, terms_accepted_at, signup_ip, country, sophisticated_at)
-         values ($1, $2, $3, $4, now(), $5, $6, case when $7::boolean then now() else null end)
+        `insert into users (email, first_name, last_name, password_hash, terms_accepted_at, signup_ip,
+                            country, sophisticated_at, referred_by)
+         values ($1, $2, $3, $4, now(), $5, $6, case when $7::boolean then now() else null end, $8)
          returning id, email, first_name, last_name, status, role, email_verified_at, created_at`,
-        [email, firstName, lastName, passwordHash, ip, country, isSophisticated]
+        [email, firstName, lastName, passwordHash, ip, country, isSophisticated, referredBy]
       );
       return inserted.rows[0];
     });
@@ -855,6 +1069,7 @@ authRouter.post("/register", async (req, res, next) => {
       await query("update users set role = 'admin', updated_at = now() where id = $1", [user.id]);
       user.role = "admin";
     }
+    void assignReferralCode(user.id).catch((e) => console.error("[ib] code:", e.message));
     void sendVerification(user.id, email, firstName);
     await logEvent("verify_sent", email, ip);
     const token = await createSession(user.id, req);
@@ -1042,8 +1257,8 @@ authRouter.post("/logout-all", requireAuth, async (req, res, next) => {
 });
 
 // server/admin.ts
-import { Router as Router2 } from "express";
-var adminRouter = Router2();
+import { Router as Router3 } from "express";
+var adminRouter = Router3();
 adminRouter.use(requireAdmin);
 function clientIp2(req) {
   return visitorIp(req);
@@ -1289,6 +1504,152 @@ adminRouter.get("/events", async (req, res, next) => {
     next(err);
   }
 });
+adminRouter.get("/ib", async (_req, res, next) => {
+  try {
+    const rows = await query(
+      `select u.id, u.email, u.first_name, u.last_name, u.referral_code, u.ib_approved_at,
+              (select count(*) from users r where r.referred_by = u.id)::text as referrals,
+              coalesce((select sum(amount) from commissions c where c.ib_id = u.id), 0)::text as earned,
+              coalesce((select sum(amount) from payout_requests p where p.ib_id = u.id and p.status = 'paid'), 0)::text as paid,
+              coalesce((select sum(amount) from payout_requests p where p.ib_id = u.id and p.status = 'requested'), 0)::text as requested
+         from users u
+        where u.ib_approved_at is not null
+           or exists (select 1 from users r where r.referred_by = u.id)
+        order by u.ib_approved_at nulls last, u.created_at desc
+        limit 200`
+    );
+    res.json({
+      ok: true,
+      partners: rows.rows.map((r) => {
+        const earned = Number(r.earned);
+        const paid = Number(r.paid);
+        const requested = Number(r.requested);
+        return {
+          id: String(r.id),
+          email: r.email,
+          name: `${r.first_name ?? ""} ${r.last_name ?? ""}`.trim(),
+          referralCode: r.referral_code,
+          approved: r.ib_approved_at !== null,
+          referrals: Number(r.referrals),
+          earned,
+          paid,
+          requested,
+          // Same formula as the partner's own view, so the two never disagree.
+          available: Math.max(earned - paid - requested, 0)
+        };
+      })
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+adminRouter.post("/ib/:id/status", async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const approve = req.body?.approved === true;
+    if (!/^\d+$/.test(id)) {
+      res.status(400).json({ ok: false, message: "Bad id." });
+      return;
+    }
+    const updated = await query(
+      `update users set ib_approved_at = ${approve ? "now()" : "null"}, updated_at = now()
+        where id = $1 returning email`,
+      [id]
+    );
+    if (updated.rowCount === 0) {
+      res.status(404).json({ ok: false, message: "No such account." });
+      return;
+    }
+    await record(req, approve ? "ib:approved" : "ib:revoked", id, updated.rows[0].email);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+adminRouter.post("/ib/:id/commission", async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const amount = Number(req.body?.amount);
+    const note = String(req.body?.note ?? "").trim().slice(0, 300);
+    if (!/^\d+$/.test(id)) {
+      res.status(400).json({ ok: false, message: "Bad id." });
+      return;
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      res.status(400).json({ ok: false, message: "Enter a positive amount.", field: "amount" });
+      return;
+    }
+    await query(
+      "insert into commissions (ib_id, amount, source, note) values ($1, $2, 'manual', $3)",
+      [id, amount.toFixed(2), note || null]
+    );
+    await record(req, "ib:commission", id, `${amount.toFixed(2)}${note ? ` - ${note}` : ""}`);
+    res.status(201).json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+adminRouter.get("/payouts", async (req, res, next) => {
+  try {
+    const status = typeof req.query.status === "string" ? req.query.status.slice(0, 20) : "";
+    const rows = await query(
+      `select p.id, p.amount::text, p.destination, p.status, p.note, p.decided_note,
+              p.requested_at, p.decided_at, u.email, u.id as ib_id
+         from payout_requests p join users u on u.id = p.ib_id
+        where ($1::text = '' or p.status = $1)
+        order by case when p.status = 'requested' then 0 else 1 end, p.requested_at desc
+        limit 200`,
+      [status]
+    );
+    res.json({
+      ok: true,
+      payouts: rows.rows.map((r) => ({
+        id: String(r.id),
+        ibId: String(r.ib_id),
+        email: r.email,
+        amount: Number(r.amount),
+        destination: r.destination,
+        status: r.status,
+        decidedNote: r.decided_note,
+        requestedAt: new Date(r.requested_at).toISOString(),
+        decidedAt: r.decided_at ? new Date(r.decided_at).toISOString() : null
+      }))
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+adminRouter.post("/payouts/:id/decide", async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const status = String(req.body?.status ?? "");
+    const note = String(req.body?.note ?? "").trim().slice(0, 300);
+    if (!/^\d+$/.test(id)) {
+      res.status(400).json({ ok: false, message: "Bad id." });
+      return;
+    }
+    if (status !== "paid" && status !== "rejected") {
+      res.status(400).json({ ok: false, message: "Decision must be paid or rejected." });
+      return;
+    }
+    const updated = await query(
+      `update payout_requests p set status = $1, decided_at = now(), decided_by = $2, decided_note = $3
+         from users u
+        where p.id = $4 and p.status = 'requested' and u.id = p.ib_id
+        returning p.amount::text, u.email, p.ib_id`,
+      [status, req.user.id, note || null, id]
+    );
+    if (updated.rowCount === 0) {
+      res.status(409).json({ ok: false, message: "That request has already been decided." });
+      return;
+    }
+    const row = updated.rows[0];
+    await record(req, `payout:${status}`, row.ib_id, `${row.amount} to ${row.email}`);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
 adminRouter.get("/actions", async (req, res, next) => {
   try {
     const limit = Math.min(Math.max(Number(req.query.limit) || 60, 1), 300);
@@ -1316,8 +1677,8 @@ adminRouter.get("/actions", async (req, res, next) => {
 });
 
 // server/google.ts
-import { createHash as createHash2, randomBytes as randomBytes3, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
-import { Router as Router3 } from "express";
+import { createHash as createHash2, randomBytes as randomBytes4, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
+import { Router as Router4 } from "express";
 var CLIENT_ID = process.env.GOOGLE_CLIENT_ID ?? "";
 var CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET ?? "";
 var SITE = (process.env.SITE_URL ?? "https://nucleusmarkets.com").replace(/\/+$/, "");
@@ -1333,8 +1694,8 @@ function sameSecret(a, b) {
   const y = Buffer.from(b);
   return x.length === y.length && timingSafeEqual2(x, y);
 }
-function fail(res, mode, code) {
-  res.redirect(303, `/${mode}?google=${encodeURIComponent(code)}`);
+function fail(res, mode, code2) {
+  res.redirect(303, `/${mode}?google=${encodeURIComponent(code2)}`);
 }
 function clearState(res) {
   res.clearCookie(STATE_COOKIE, { httpOnly: true, secure: isProd2, sameSite: "lax", path: STATE_PATH });
@@ -1354,14 +1715,14 @@ function readIdToken(idToken) {
   }
 }
 var clean = (v, max2 = 80) => typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, max2) : "";
-var placeholderHash = () => `scrypt$16384$8$1$${randomBytes3(16).toString("base64")}$${randomBytes3(64).toString("base64")}`;
-var googleRouter = Router3();
+var placeholderHash = () => `scrypt$16384$8$1$${randomBytes4(16).toString("base64")}$${randomBytes4(64).toString("base64")}`;
+var googleRouter = Router4();
 googleRouter.get("/google/start", (req, res) => {
   const mode = req.query.mode === "register" ? "register" : "login";
   if (!googleEnabled) return fail(res, mode, "off");
   const pending = {
-    state: b64url(randomBytes3(24)),
-    verifier: b64url(randomBytes3(48)),
+    state: b64url(randomBytes4(24)),
+    verifier: b64url(randomBytes4(48)),
     mode,
     terms: mode === "register" && req.query.terms === "1",
     country: mode === "register" ? clean(req.query.country, 8).toUpperCase() : "",
@@ -1402,9 +1763,9 @@ googleRouter.get("/google/callback", async (req, res) => {
   const mode = pending?.mode === "register" ? "register" : "login";
   if (typeof req.query.error === "string") return fail(res, mode, "cancelled");
   const state = typeof req.query.state === "string" ? req.query.state : "";
-  const code = typeof req.query.code === "string" ? req.query.code : "";
+  const code2 = typeof req.query.code === "string" ? req.query.code : "";
   if (!googleEnabled) return fail(res, mode, "off");
-  if (!pending || !state || !code || !sameSecret(state, pending.state)) {
+  if (!pending || !state || !code2 || !sameSecret(state, pending.state)) {
     await logEvent("google_bad_state", null, ip);
     return fail(res, mode, "expired");
   }
@@ -1413,7 +1774,7 @@ googleRouter.get("/google/callback", async (req, res) => {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
-        code,
+        code: code2,
         client_id: CLIENT_ID,
         client_secret: CLIENT_SECRET,
         redirect_uri: REDIRECT_URI,
@@ -1579,6 +1940,7 @@ if (dbConfigured) {
   app.use("/api/auth", googleRouter);
   app.use("/api/auth", authRouter);
   app.use("/api/admin", adminRouter);
+  app.use("/api/ib", ibRouter);
 } else {
   app.use("/api/auth", (_req, res) => {
     res.status(503).json({
