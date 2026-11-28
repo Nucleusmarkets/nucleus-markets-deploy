@@ -817,10 +817,10 @@ function shell(opts) {
     <tr><td align="center">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#0a0c18;border:1px solid rgba(255,255,255,0.08);border-radius:18px;padding:36px">
         <tr><td>
-          <p style="margin:0;font-size:12px;letter-spacing:4px;color:#22d3ee;text-transform:uppercase">Nucleus Markets</p>
+          <p style="margin:0;font-size:12px;letter-spacing:4px;color:#22b5f3;text-transform:uppercase">Nucleus Markets</p>
           <h1 style="margin:16px 0 0;font-size:25px;line-height:1.25;color:#ffffff;font-weight:600">${opts.title}</h1>
           <div style="margin:16px 0 0;font-size:15px;line-height:1.65;color:#aab0c6">${opts.body}</div>
-          ${opts.cta ? `<p style="margin:28px 0 0"><a href="${opts.cta.href}" style="display:inline-block;background:#22d3ee;color:#05060d;text-decoration:none;font-weight:600;font-size:15px;padding:14px 26px;border-radius:999px">${opts.cta.label}</a></p>
+          ${opts.cta ? `<p style="margin:28px 0 0"><a href="${opts.cta.href}" style="display:inline-block;background:#22b5f3;color:#05060d;text-decoration:none;font-weight:600;font-size:15px;padding:14px 26px;border-radius:999px">${opts.cta.label}</a></p>
           <p style="margin:22px 0 0;font-size:13px;line-height:1.6;color:#6b7391">If the button does not work, paste this into your browser:<br><span style="color:#8fa0bd;word-break:break-all">${opts.cta.href}</span></p>` : ""}
           <p style="margin:28px 0 0;padding-top:20px;border-top:1px solid rgba(255,255,255,0.08);font-size:13px;line-height:1.6;color:#6b7391">${opts.footer}</p>
         </td></tr>
@@ -875,14 +875,14 @@ function deployEmail(info, site) {
     <tr><td align="center">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#0a0c18;border:1px solid rgba(255,255,255,0.08);border-radius:18px;padding:32px">
         <tr><td>
-          <p style="margin:0;font-size:12px;letter-spacing:4px;color:#22d3ee;text-transform:uppercase">Nucleus Markets</p>
+          <p style="margin:0;font-size:12px;letter-spacing:4px;color:#22b5f3;text-transform:uppercase">Nucleus Markets</p>
           <h1 style="margin:14px 0 0;font-size:22px;line-height:1.3;color:#ffffff;font-weight:600">${safeSubject}</h1>
           <p style="margin:10px 0 0;font-size:13px;color:#6b7391">
             <code style="color:#8fa0bd">${escapeHtml(info.commit)}</code> &middot; ${when}
           </p>
           ${safeBody ? `<div style="margin:22px 0 0;padding:16px;background:rgba(255,255,255,0.03);border-radius:12px;font-size:14px;line-height:1.65;color:#aab0c6">${safeBody}</div>` : ""}
           <p style="margin:26px 0 0">
-            <a href="${site}/admin" style="display:inline-block;background:#22d3ee;color:#05060d;text-decoration:none;font-weight:600;font-size:14px;padding:12px 24px;border-radius:999px">Open the back office</a>
+            <a href="${site}/admin" style="display:inline-block;background:#22b5f3;color:#05060d;text-decoration:none;font-weight:600;font-size:14px;padding:12px 24px;border-radius:999px">Open the back office</a>
           </p>
           <p style="margin:24px 0 0;padding-top:18px;border-top:1px solid rgba(255,255,255,0.08);font-size:12px;line-height:1.6;color:#6b7391">
             Sent automatically to every admin whenever ${escapeHtml(site.replace(/^https?:\/\//, ""))} is deployed.
